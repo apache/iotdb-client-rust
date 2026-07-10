@@ -84,3 +84,10 @@ jobs:
       # Includes the live-server tests now that IoTDB is reachable.
       - name: Integration tests
         run: cargo test
+
+      # Examples double as end-to-end smoke tests against the live server.
+      - name: Run examples
+        run: |
+          cargo run --example tree_session
+          cargo run --example table_session
+          cargo run --example session_pool

@@ -541,4 +541,105 @@ mod tests {
         session.close().expect("close session");
         assert!(!session.is_open());
     }
+
+    /// Value-asserting live roundtrip: unsorted input, nulls, and a row count
+    /// that is a multiple of 8 (stresses the rows/8+1 bitmap padding byte).
+    /// Skipped when no IoTDB instance is reachable on localhost:6667.
+    #[test]
+    fn live_insert_tablet_readback() {
+        use crate::data::{tablet::Tablet, TSDataType, Value};
+        use std::net::TcpStream;
+        if TcpStream::connect_timeout(
+            &"127.0.0.1:6667".parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_err()
+        {
+            eprintln!("skipping live_insert_tablet_readback: no IoTDB server on 127.0.0.1:6667");
+            return;
+        }
+
+        const DB: &str = "root.rusttest_readback";
+        const ROWS: i64 = 16;
+
+        let mut session = Session::new(SessionConfig::default());
+        session.open().expect("open session");
+        // Fresh database (ignore error if it doesn't exist yet).
+        let _ = session.execute_non_query(&format!("DELETE DATABASE {DB}"));
+        session
+            .execute_non_query(&format!("CREATE DATABASE {DB}"))
+            .expect("create database");
+
+        let mut tablet = Tablet::new(
+            format!("{DB}.d1"),
+            vec!["ival".into(), "dval".into(), "sval".into()],
+            vec![TSDataType::Int32, TSDataType::Double, TSDataType::Text],
+        )
+        .expect("tablet");
+        // Insert in reverse timestamp order; serialization must sort.
+        for ts in (0..ROWS).rev() {
+            let ival = if ts % 3 == 0 {
+                None
+            } else {
+                Some(Value::Int32(ts as i32 * 10))
+            };
+            let dval = if ts % 5 == 0 {
+                None
+            } else {
+                Some(Value::Double(ts as f64 + 0.5))
+            };
+            let sval = Some(Value::Text(format!("row-{ts}")));
+            tablet.add_row(ts, vec![ival, dval, sval]).expect("add_row");
+        }
+        session.insert_tablet(&tablet).expect("insert_tablet");
+
+        // Read back all rows and assert every cell.
+        let mut seen = 0i64;
+        {
+            let mut dataset = session
+                .execute_query(&format!("SELECT ival, dval, sval FROM {DB}.d1"))
+                .expect("query");
+            while let Some(row) = dataset.next_row().expect("next_row") {
+                let ts = row.timestamp.expect("timestamp");
+                assert_eq!(ts, seen, "rows must come back in ascending time order");
+                let expect_ival = if ts % 3 == 0 {
+                    Value::Null
+                } else {
+                    Value::Int32(ts as i32 * 10)
+                };
+                let expect_dval = if ts % 5 == 0 {
+                    Value::Null
+                } else {
+                    Value::Double(ts as f64 + 0.5)
+                };
+                assert_eq!(row.values[0], expect_ival, "ival at ts={ts}");
+                assert_eq!(row.values[1], expect_dval, "dval at ts={ts}");
+                assert_eq!(
+                    row.values[2],
+                    Value::Text(format!("row-{ts}")),
+                    "sval at ts={ts}"
+                );
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, ROWS, "row count");
+
+        // Filtered query must honor the predicate.
+        let mut filtered = 0i64;
+        {
+            let mut dataset = session
+                .execute_query(&format!("SELECT sval FROM {DB}.d1 WHERE time >= 10"))
+                .expect("filtered query");
+            while let Some(row) = dataset.next_row().expect("next_row") {
+                assert!(row.timestamp.expect("timestamp") >= 10);
+                filtered += 1;
+            }
+        }
+        assert_eq!(filtered, ROWS - 10, "filtered row count");
+
+        session
+            .execute_non_query(&format!("DELETE DATABASE {DB}"))
+            .expect("cleanup");
+        session.close().expect("close session");
+    }
 }
