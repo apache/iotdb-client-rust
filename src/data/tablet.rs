@@ -194,8 +194,10 @@ impl Tablet {
     /// Serializes the value buffer per spec §3.2–3.3: all columns
     /// column-major (nulls occupy placeholder slots), then one trailing
     /// bitmap entry per column — a flag byte (1 = column has nulls) followed,
-    /// when flagged, by a `ceil(rows/8)`-byte LSB-first bitmap with bit=1 for
-    /// null rows. All multi-byte values big-endian.
+    /// when flagged, by a `rows/8 + 1`-byte LSB-first bitmap with bit=1 for
+    /// null rows (the server's Java `BitMap` always allocates — and reads —
+    /// `size/8 + 1` bytes, one extra padding byte when `rows % 8 == 0`).
+    /// All multi-byte values big-endian.
     ///
     /// Sorts rows by timestamp first (spec §3.5).
     pub fn serialize_values(&mut self) -> Vec<u8> {
@@ -212,7 +214,10 @@ impl Tablet {
             let nulls: Vec<bool> = col.iter().map(Option::is_none).collect();
             if nulls.iter().any(|&n| n) {
                 buf.push(1);
-                buf.extend_from_slice(&pack_bits_lsb_first(&nulls));
+                // Pad to the server's fixed `rows/8 + 1` BitMap length.
+                let mut bitmap = pack_bits_lsb_first(&nulls);
+                bitmap.resize(rows / 8 + 1, 0);
+                buf.extend_from_slice(&bitmap);
             } else {
                 buf.push(0);
             }
@@ -432,19 +437,21 @@ mod tests {
     }
 
     #[test]
-    fn bitmap_is_ceil_rows_over_8() {
-        // 8 rows with a null: exactly 1 bitmap byte (ceil, not rows/8 + 1).
+    fn bitmap_is_rows_over_8_plus_1() {
+        // 8 rows with a null: the server's BitMap always reads rows/8 + 1
+        // bytes, so an 8-row bitmap is 2 bytes (1 data + 1 padding).
         let mut t = tree_tablet(vec![TSDataType::Int32]);
         for i in 0..8 {
             let cell = if i == 7 { None } else { Some(Value::Int32(i)) };
             t.add_row(i64::from(i), vec![cell]).unwrap();
         }
         let buf = t.serialize_values();
-        assert_eq!(buf.len(), 8 * 4 + 1 + 1);
+        assert_eq!(buf.len(), 8 * 4 + 1 + 2);
         assert_eq!(buf[8 * 4], 0x01); // flag
         assert_eq!(buf[8 * 4 + 1], 0x80); // row 7 null, LSB-first → bit 7
+        assert_eq!(buf[8 * 4 + 2], 0x00); // padding byte
 
-        // 9 rows: 2 bitmap bytes.
+        // 9 rows: still 2 bitmap bytes (9/8 + 1 = 2).
         let mut t = tree_tablet(vec![TSDataType::Int32]);
         for i in 0..9 {
             let cell = if i == 8 { None } else { Some(Value::Int32(i)) };

@@ -1,42 +1,42 @@
-# Apache IoTDB Rust Client
+# Apache IoTDB Rust 客户端
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 
 [English](./README.md) | [中文](./README_ZH.md)
 
-Rust client SDK for [Apache IoTDB](https://iotdb.apache.org/), speaking Apache Thrift RPC (default port 6667). Supports both IoTDB data models, mirroring the architecture of the Node.js and C# SDKs:
+[Apache IoTDB](https://iotdb.apache.org/) 的 Rust 客户端 SDK，基于 Apache Thrift RPC（默认端口 6667）。支持 IoTDB 的两种数据模型，架构与 Node.js、C# SDK 保持一致：
 
-- **Tree model** — `Session` / `SessionPool`: device/timeseries paths (`root.sg.d1.s1`)
-- **Table model** — `TableSession` / `TableSessionPool`: relational SQL dialect
+- **树模型** — `Session` / `SessionPool`：设备/时间序列路径（`root.sg.d1.s1`）
+- **表模型** — `TableSession` / `TableSessionPool`：关系型 SQL 方言
 
-## Status
+## 状态
 
-Working client: session management (with multi-node failover), tablet writes (`insertTablet`) for both models, TsBlock query decoding with paging iteration, and thread-safe session pools. Not yet published to crates.io.
+可用的客户端：会话管理（支持多节点故障转移）、两种模型的 Tablet 批量写入（`insertTablet`）、TsBlock 查询解码及分页迭代、线程安全的会话池。尚未发布到 crates.io。
 
-## Requirements
+## 环境要求
 
 - Rust 1.75+
-- Apache IoTDB 2.x (examples and integration tests use `apache/iotdb:2.0.6-standalone`)
+- Apache IoTDB 2.x（示例与集成测试使用 `apache/iotdb:2.0.6-standalone`）
 
-## Installation
+## 安装
 
-Once published to crates.io:
+发布到 crates.io 之后：
 
 ```toml
 [dependencies]
 iotdb-client = "0.1"
 ```
 
-Until then, use a git dependency:
+在此之前，可使用 git 依赖：
 
 ```toml
 [dependencies]
 iotdb-client = { git = "https://github.com/apache/iotdb-client-rust" }
 ```
 
-## Quick start
+## 快速开始
 
-### Tree model
+### 树模型
 
 ```rust
 use iotdb_client::{Result, Session, SessionConfig, TSDataType, Tablet, Value};
@@ -51,17 +51,17 @@ fn main() -> Result<()> {
         "CREATE TIMESERIES root.demo.d1.temperature WITH DATATYPE=DOUBLE, ENCODING=PLAIN",
     )?;
 
-    // Batch write via a column-major tablet (nulls allowed).
+    // 通过列式 Tablet 批量写入（允许 null）。
     let mut tablet = Tablet::new(
         "root.demo.d1",
         vec!["temperature".into()],
         vec![TSDataType::Double],
     )?;
     tablet.add_row(1_720_000_000_000, vec![Some(Value::Double(21.5))])?;
-    tablet.add_row(1_720_000_001_000, vec![None])?; // null cell
+    tablet.add_row(1_720_000_001_000, vec![None])?; // null 单元格
     session.insert_tablet(&tablet)?;
 
-    // Query with row iteration; the dataset borrows the session until dropped.
+    // 逐行迭代查询结果；数据集在被 drop 之前持有会话的借用。
     {
         let mut dataset = session.execute_query("SELECT temperature FROM root.demo.d1")?;
         while let Some(row) = dataset.next_row()? {
@@ -74,7 +74,7 @@ fn main() -> Result<()> {
 }
 ```
 
-### Table model
+### 表模型
 
 ```rust
 use iotdb_client::{ColumnCategory, Result, TSDataType, TableSession, Tablet, Value};
@@ -119,7 +119,7 @@ fn main() -> Result<()> {
 }
 ```
 
-### Session pool
+### 会话池
 
 ```rust
 use std::sync::Arc;
@@ -137,7 +137,7 @@ fn main() -> Result<()> {
         .map(|_| {
             let pool = Arc::clone(&pool);
             std::thread::spawn(move || -> Result<()> {
-                let mut session = pool.acquire()?; // RAII guard, released on drop
+                let mut session = pool.acquire()?; // RAII 守卫，drop 时归还
                 session.execute_non_query("SHOW DATABASES")?;
                 Ok(())
             })
@@ -152,7 +152,7 @@ fn main() -> Result<()> {
 }
 ```
 
-Full runnable versions live in [`examples/`](./examples):
+完整可运行版本见 [`examples/`](./examples)：
 
 ```sh
 cargo run --example tree_session
@@ -160,54 +160,54 @@ cargo run --example table_session
 cargo run --example session_pool
 ```
 
-## Thrift codegen
+## Thrift 代码生成
 
-Generated stubs live in `src/protocol/` (`client.rs`, `common.rs`); never hand-edit them. The IDL sources in `thrift/` are synced from the IoTDB repo's `iotdb-protocol/` (`thrift-datanode/src/main/thrift/client.thrift`, `thrift-commons/src/main/thrift/common.thrift`).
+生成的桩代码位于 `src/protocol/`（`client.rs`、`common.rs`），请勿手动编辑。`thrift/` 中的 IDL 源文件从 IoTDB 仓库的 `iotdb-protocol/` 同步（`thrift-datanode/src/main/thrift/client.thrift`、`thrift-commons/src/main/thrift/common.thrift`）。
 
-Regenerate with:
+重新生成：
 
 ```sh
 ./tools/generate-thrift.sh
 ```
 
-The script picks the Thrift compiler in order of preference:
+脚本按以下优先级选择 Thrift 编译器：
 
-1. `$THRIFT_BIN` if set
-2. the IoTDB repo's Maven build output (`$IOTDB_REPO`, default `../iotdb`): `iotdb-protocol/*/target/thrift/bin/thrift` — run `./mvnw generate-sources -pl iotdb-protocol/thrift-datanode -am` there first. This guarantees the exact Thrift version pinned by the IoTDB pom.
-3. `thrift` on `PATH` (version must match the IoTDB pom's `thrift.version`)
+1. `$THRIFT_BIN`（若已设置）
+2. IoTDB 仓库 Maven 构建产物（`$IOTDB_REPO`，默认 `../iotdb`）：`iotdb-protocol/*/target/thrift/bin/thrift` — 需先在该仓库执行 `./mvnw generate-sources -pl iotdb-protocol/thrift-datanode -am`。这可保证 Thrift 版本与 IoTDB pom 中固定的版本完全一致。
+3. `PATH` 上的 `thrift`（版本须与 IoTDB pom 的 `thrift.version` 匹配）
 
-When `$IOTDB_REPO` is present, the IDL files are re-synced from it before generation, and the Apache license headers are re-prepended to the generated files.
+当 `$IOTDB_REPO` 存在时，生成前会先从其重新同步 IDL 文件，并在生成后为生成文件重新添加 Apache 许可证头。
 
-## Development
-
-```sh
-cargo build                              # build
-cargo test                               # unit tests (live tests self-skip without a server)
-cargo test test_name                     # single test
-cargo fmt --check                        # format check
-cargo clippy --all-targets -- -D warnings  # lint
-./tools/check-license.sh                 # license header check
-```
-
-Integration tests need a running IoTDB; the live tests detect it on `127.0.0.1:6667` and skip gracefully when absent:
+## 开发
 
 ```sh
-docker compose up -d   # standalone IoTDB (see docker-compose-1c1d.yml for a 1C1D cluster)
-cargo test             # now includes the live-server tests
+cargo build                              # 构建
+cargo test                               # 单元测试（无服务器时在线测试自动跳过）
+cargo test test_name                     # 运行单个测试
+cargo fmt --check                        # 格式检查
+cargo clippy --all-targets -- -D warnings  # 静态检查
+./tools/check-license.sh                 # 许可证头检查
 ```
 
-## Project layout
+集成测试需要一个运行中的 IoTDB；在线测试会探测 `127.0.0.1:6667`，服务器不可达时自动跳过：
 
-| Path | Contents |
+```sh
+docker compose up -d   # 单机版 IoTDB（1C1D 集群拓扑见 docker-compose-1c1d.yml）
+cargo test             # 此时包含在线测试
+```
+
+## 项目结构
+
+| 路径 | 内容 |
 | --- | --- |
-| `src/client/` | `Session`, `TableSession`, `SessionPool`, `TableSessionPool`, `SessionDataSet` |
-| `src/connection/` | Low-level Thrift transport (framed transport + binary protocol) |
-| `src/data/` | `Tablet`, `Value`, `TSDataType` (official TSFile codes 0–11), TsBlock decoding, bitmaps |
-| `src/protocol/` | Generated Thrift stubs (do not edit) |
-| `thrift/` | Thrift IDL sources, synced from the IoTDB repo |
-| `examples/` | Runnable examples for both models and the pools |
-| `tools/` | Codegen and license-check scripts |
+| `src/client/` | `Session`、`TableSession`、`SessionPool`、`TableSessionPool`、`SessionDataSet` |
+| `src/connection/` | 底层 Thrift 传输（帧传输 + 二进制协议） |
+| `src/data/` | `Tablet`、`Value`、`TSDataType`（官方 TSFile 编码 0–11）、TsBlock 解码、位图 |
+| `src/protocol/` | 生成的 Thrift 桩代码（勿编辑） |
+| `thrift/` | Thrift IDL 源文件，从 IoTDB 仓库同步 |
+| `examples/` | 两种模型及会话池的可运行示例 |
+| `tools/` | 代码生成与许可证检查脚本 |
 
-## License
+## 许可证
 
 [Apache License 2.0](./LICENSE)

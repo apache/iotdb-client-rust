@@ -64,4 +64,15 @@ fi
 # src/protocol/. Rewrite the cross-module path.
 sed -i '' 's/use crate::common;/use crate::protocol::common;/' src/protocol/client.rs
 
+# Re-prepend the Apache license header (the generator emits bare files).
+for f in src/protocol/common.rs src/protocol/client.rs; do
+  if ! head -30 "$f" | grep -q "Licensed to the Apache Software Foundation"; then
+    tmp=$(mktemp)
+    sed 's/^/\/\/ /; s/ *$//' tools/license-header.txt > "$tmp"
+    printf '\n' >> "$tmp"
+    cat "$f" >> "$tmp"
+    mv "$tmp" "$f"
+  fi
+done
+
 echo "Generated src/protocol/{common,client}.rs"
