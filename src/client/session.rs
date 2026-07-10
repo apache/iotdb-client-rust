@@ -21,7 +21,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::client::dataset::SessionDataSet;
 use crate::connection::{Connection, Endpoint};
+use crate::data::Tablet;
 use crate::error::{Error, Result};
 use crate::protocol::client::{
     TIClientRPCServiceSyncClient, TSCloseOperationReq, TSCloseSessionReq, TSExecuteStatementReq,
@@ -217,9 +219,19 @@ impl Session {
         Ok(())
     }
 
+    /// Execute a query statement, returning a [`SessionDataSet`] that
+    /// borrows this session until it is dropped or closed — fetches and
+    /// closeOperation must reach the node that owns the query id (spec
+    /// gotcha #13), so the connection stays pinned to the result set.
+    pub fn execute_query(&mut self, sql: &str) -> Result<SessionDataSet<'_>> {
+        let handle = self.execute_query_raw(sql)?;
+        Ok(SessionDataSet::new(self, handle))
+    }
+
     /// Execute a query statement, returning raw TsBlock bytes plus metadata.
-    /// Decoding happens in the data layer.
-    pub fn execute_query(&mut self, sql: &str) -> Result<QueryHandle> {
+    /// Low-level path: decoding and pagination are the caller's problem —
+    /// prefer [`Session::execute_query`].
+    pub fn execute_query_raw(&mut self, sql: &str) -> Result<QueryHandle> {
         let req = self.statement_req(sql);
         let resp = self
             .connection_mut()?
@@ -276,12 +288,42 @@ impl Session {
         }
     }
 
+    /// Insert a [`Tablet`] (tree or table model). Serializes per protocol
+    /// spec §3 — column-major values with trailing null bitmaps, i64-BE
+    /// timestamps — sorting rows by timestamp first (spec §3.5). Table-model
+    /// tablets are sent with `writeToTable=true` plus their column
+    /// categories, and are never aligned (spec §6).
+    pub fn insert_tablet(&mut self, tablet: &Tablet) -> Result<()> {
+        // Serialization sorts in place; clone so the caller's tablet order
+        // is untouched (the clone is cheap relative to the RPC).
+        let mut tablet = tablet.clone();
+        let values = tablet.serialize_values();
+        let timestamps = tablet.serialize_timestamps();
+        let (write_to_table, column_categories) = match tablet.column_categories() {
+            Some(categories) => (
+                Some(true),
+                Some(categories.iter().map(|c| c.code()).collect()),
+            ),
+            None => (None, None),
+        };
+        self.insert_tablet_raw(
+            tablet.target(),
+            tablet.measurements().to_vec(),
+            tablet.types().iter().map(|t| t.code()).collect(),
+            values,
+            timestamps,
+            tablet.row_count() as i32,
+            tablet.is_aligned(),
+            write_to_table,
+            column_categories,
+        )
+    }
+
     /// Insert a tablet from pre-serialized buffers (see protocol spec §3).
     ///
     /// `values` is the column-major value buffer with trailing null bitmaps;
-    /// `timestamps` is the `size × 8-byte i64 BE` buffer. Serialization from a
-    /// `Tablet` lives in the data layer; a typed `insert_tablet(&Tablet)` is
-    /// wired in the next phase.
+    /// `timestamps` is the `size × 8-byte i64 BE` buffer. Prefer the typed
+    /// [`Session::insert_tablet`]; this is the low-level escape hatch.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_tablet_raw(
         &mut self,
@@ -488,9 +530,13 @@ mod tests {
         session.open().expect("open session");
         assert!(session.is_open());
 
-        let handle = session.execute_query("SHOW DATABASES").expect("query");
-        assert!(!handle.columns.is_empty());
-        session.close_query(handle.query_id);
+        {
+            let mut dataset = session.execute_query("SHOW DATABASES").expect("query");
+            assert!(!dataset.columns().is_empty());
+            while let Some(row) = dataset.next_row().expect("next_row") {
+                assert_eq!(row.values.len(), dataset.columns().len());
+            }
+        } // dataset drop closes the query and releases the session borrow
 
         session.close().expect("close session");
         assert!(!session.is_open());

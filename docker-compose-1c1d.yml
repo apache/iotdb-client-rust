@@ -1,0 +1,66 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Single-node IoTDB cluster (1 ConfigNode + 1 DataNode) for integration tests.
+# Usage: docker compose -f docker-compose-1c1d.yml up -d
+#        cargo test -- --ignored   # or: cargo test (integration tests detect the server)
+
+services:
+  iotdb-datanode:
+    image: apache/iotdb:2.0.6-datanode
+    container_name: iotdb-rust-datanode
+    restart: always
+    depends_on:
+      iotdb-confignode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "ls", "/iotdb/data/datanode/system"]
+      interval: 10s
+      timeout: 60s
+      retries: 30
+      start_period: 30s
+    ports:
+      - "6667:6667"
+    networks:
+      - iotdb-network
+    environment:
+      - dn_rpc_address=iotdb-datanode
+      - dn_internal_address=iotdb-datanode
+      - dn_seed_config_node=iotdb-confignode:10710
+      - IOTDB_JMX_OPTS=-Xms1G -Xmx1G -XX:MaxDirectMemorySize=384M
+
+  iotdb-confignode:
+    image: apache/iotdb:2.0.6-confignode
+    container_name: iotdb-rust-confignode
+    restart: always
+    healthcheck:
+      test: ["CMD", "ls", "/iotdb/data"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+    networks:
+      - iotdb-network
+    environment:
+      - cn_internal_address=iotdb-confignode
+      - cn_internal_port=10710
+      - cn_seed_config_node=iotdb-confignode:10710
+      - CONFIGNODE_JMX_OPTS=-Xms384M -Xmx384M -XX:MaxDirectMemorySize=192M
+
+networks:
+  iotdb-network:
+    driver: bridge

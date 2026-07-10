@@ -23,12 +23,13 @@ use super::value::Value;
 use super::TSDataType;
 use crate::error::{Error, Result};
 
-/// TsBlock column encodings (spec §5.2).
-const ENCODING_BYTE_ARRAY: u8 = 0;
-const ENCODING_INT32_ARRAY: u8 = 1;
-const ENCODING_INT64_ARRAY: u8 = 2;
-const ENCODING_BINARY_ARRAY: u8 = 3;
-const ENCODING_RLE: u8 = 4;
+/// TsBlock column encodings (spec §5.2). `pub(crate)` so the dataset tests
+/// can craft synthetic blocks with the same constants.
+pub(crate) const ENCODING_BYTE_ARRAY: u8 = 0;
+pub(crate) const ENCODING_INT32_ARRAY: u8 = 1;
+pub(crate) const ENCODING_INT64_ARRAY: u8 = 2;
+pub(crate) const ENCODING_BINARY_ARRAY: u8 = 3;
+pub(crate) const ENCODING_RLE: u8 = 4;
 
 /// One decoded TsBlock: `position_count` rows of a time column plus
 /// `columns.len()` value columns. Null cells are [`Value::Null`].
@@ -294,13 +295,15 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Encoding helpers for crafting synthetic TsBlocks in unit tests (shared
+/// with the dataset state-machine tests).
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_util {
     use super::*;
 
     /// Builds a TsBlock header: valueColumnCount, type bytes, positionCount,
     /// time encoding (Int64Array), value encodings.
-    fn header(types: &[TSDataType], position_count: i32, encodings: &[u8]) -> Vec<u8> {
+    pub(crate) fn header(types: &[TSDataType], position_count: i32, encodings: &[u8]) -> Vec<u8> {
         let mut b = Vec::new();
         b.extend_from_slice(&(types.len() as i32).to_be_bytes());
         for &t in types {
@@ -313,13 +316,35 @@ mod tests {
     }
 
     /// Dense Int64Array time column with no nulls.
-    fn time_column(ts: &[i64]) -> Vec<u8> {
+    pub(crate) fn time_column(ts: &[i64]) -> Vec<u8> {
         let mut b = vec![0u8]; // mayHaveNull = 0
         for t in ts {
             b.extend_from_slice(&t.to_be_bytes());
         }
         b
     }
+
+    /// One-Int32-column block: timestamps `ts`, dense non-null values `vals`.
+    pub(crate) fn int32_block(ts: &[i64], vals: &[i32]) -> Vec<u8> {
+        assert_eq!(ts.len(), vals.len());
+        let mut b = header(
+            &[TSDataType::Int32],
+            ts.len() as i32,
+            &[ENCODING_INT32_ARRAY],
+        );
+        b.extend_from_slice(&time_column(ts));
+        b.push(0); // mayHaveNull
+        for v in vals {
+            b.extend_from_slice(&v.to_be_bytes());
+        }
+        b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::{header, time_column};
+    use super::*;
 
     #[test]
     fn int32_column_no_nulls() {

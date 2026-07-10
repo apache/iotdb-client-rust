@@ -44,6 +44,9 @@ pub struct Tablet {
     values: Vec<Vec<Option<Value>>>,
     /// Table model only: one category per column.
     column_categories: Option<Vec<ColumnCategory>>,
+    /// Tree model only: write to an aligned device. Always `false` on the
+    /// wire for table-model tablets (spec §6).
+    aligned: bool,
 }
 
 impl Tablet {
@@ -68,7 +71,19 @@ impl Tablet {
             timestamps: Vec::new(),
             values: vec![Vec::new(); columns],
             column_categories: None,
+            aligned: false,
         })
+    }
+
+    /// Creates an empty tree-model tablet for an **aligned** device.
+    pub fn new_aligned(
+        device_id: impl Into<String>,
+        measurements: Vec<String>,
+        types: Vec<TSDataType>,
+    ) -> Result<Tablet> {
+        let mut tablet = Tablet::new(device_id, measurements, types)?;
+        tablet.aligned = true;
+        Ok(tablet)
     }
 
     /// Creates an empty table-model tablet for `table_name` with one
@@ -116,6 +131,12 @@ impl Tablet {
     /// `Some` iff this is a table-model tablet.
     pub fn column_categories(&self) -> Option<&[ColumnCategory]> {
         self.column_categories.as_deref()
+    }
+
+    /// True for aligned-device tree-model tablets (spec §3.1 field 8).
+    /// Always `false` for table-model tablets.
+    pub fn is_aligned(&self) -> bool {
+        self.aligned
     }
 
     pub fn row_count(&self) -> usize {

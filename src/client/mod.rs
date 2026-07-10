@@ -15,9 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Session-layer API: tree model (`Session`) and, later, table model
-//! (`TableSession`) plus pooled variants — mirroring the Node.js and C# SDKs.
+//! Session-layer API: tree model ([`Session`]), table model
+//! ([`TableSession`]), pooled variants and query result iteration —
+//! mirroring the Node.js and C# SDKs.
 
+pub mod dataset;
+pub mod pool;
 pub mod session;
+pub mod table_session;
 
+pub use dataset::{Row, SessionDataSet};
+pub use pool::{PooledSession, SessionPool, SessionPoolConfig, TableSessionPool};
 pub use session::{QueryHandle, Session, SessionConfig};
+pub use table_session::{TableSession, TableSessionBuilder};
