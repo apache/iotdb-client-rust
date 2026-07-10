@@ -1,0 +1,22 @@
+[package]
+name = "iotdb-client"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Apache IoTDB client for Rust (tree & table model over Thrift RPC)"
+license = "Apache-2.0"
+repository = "https://github.com/apache/iotdb-client-rust"
+keywords = ["iotdb", "timeseries", "database", "client"]
+categories = ["database"]
+
+[dependencies]
+thrift = "0.23"
+byteorder = "1.5"
+chrono = "0.4"
+log = "0.4"
+
+[dev-dependencies]
+env_logger = "0.11"
+
+[features]
+default = []
