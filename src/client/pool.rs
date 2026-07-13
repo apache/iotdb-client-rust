@@ -177,6 +177,43 @@ impl SessionPool {
         }
     }
 
+    /// Acquire a session for writes to `device_id`, preferring an idle
+    /// session already connected to the device's redirected endpoint.
+    ///
+    /// A status-400 insert response leaves a device → endpoint hint in the
+    /// session that saw it ([`Session::redirect_hint`]); if any idle
+    /// session carries such a hint **and** another idle session is
+    /// connected to that endpoint, that session is handed out. In every
+    /// other case — no hint, no matching idle session, hint expired — this
+    /// is exactly [`SessionPool::acquire`]. The pool never opens a new
+    /// connection to the hinted endpoint (Node.js-style dedicated
+    /// per-endpoint sessions are future work).
+    pub fn acquire_for_device(&self, device_id: &str) -> Result<PooledSession<'_>> {
+        {
+            let mut state = self.state.lock().expect("pool lock poisoned");
+            if !state.closed {
+                // Any idle session may hold the hint (the one that got the
+                // 400), not necessarily one connected to the hinted node.
+                let hint = state
+                    .idle
+                    .iter_mut()
+                    .find_map(|s| s.redirect_hint(device_id));
+                if let Some(endpoint) = hint {
+                    let matching = state
+                        .idle
+                        .iter()
+                        .position(|s| s.is_open() && s.current_endpoint() == Some(&endpoint));
+                    if let Some(pos) = matching {
+                        let session = state.idle.remove(pos).expect("index in bounds");
+                        drop(state);
+                        return self.hand_out(session);
+                    }
+                }
+            }
+        }
+        self.acquire()
+    }
+
     /// Convenience: acquire a session, run one non-query statement, release.
     /// `USE <db>` propagates to the whole pool via the database tracking.
     pub fn execute_non_query(&self, sql: &str) -> Result<()> {
@@ -470,6 +507,88 @@ mod tests {
         };
         let pool = TableSessionPool::new(cfg).unwrap();
         assert_eq!(pool.pool.config.session.sql_dialect, "table");
+    }
+
+    /// A local listener that accepts and immediately drops connections:
+    /// `Connection::open` succeeds (giving pool tests real TCP connections
+    /// with distinct endpoints) while any RPC on them — like the swallowed
+    /// `closeSession` at pool teardown — fails fast on EOF instead of
+    /// blocking on a reply that never comes.
+    fn fake_listener() -> Endpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => drop(s),
+                    Err(_) => break,
+                }
+            }
+        });
+        Endpoint::new("127.0.0.1", port)
+    }
+
+    fn injected_session(endpoint: &Endpoint) -> Session {
+        let mut session = Session::new(dead_endpoint_config());
+        let connection =
+            crate::connection::Connection::open(endpoint.clone(), Duration::from_millis(500))
+                .expect("connect to test listener");
+        session.test_inject_connection(connection);
+        session
+    }
+
+    #[test]
+    fn acquire_for_device_prefers_hinted_endpoint() {
+        let ep_a = fake_listener();
+        let ep_b = fake_listener();
+
+        let cfg = SessionPoolConfig {
+            max_size: 4,
+            acquire_timeout: Duration::from_millis(50),
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let pool = SessionPool::new(cfg).unwrap();
+
+        // s1 (connected to A) holds the redirect hint pointing at B;
+        // s2 is connected to B — the hinted target.
+        let mut s1 = injected_session(&ep_a);
+        s1.test_inject_redirect_hint("root.sg.d1", ep_b.clone());
+        let s2 = injected_session(&ep_b);
+        pool.inject_idle(s1);
+        pool.inject_idle(s2);
+
+        // Hinted device → the session on endpoint B, even though the
+        // session on A is first in the idle queue.
+        let guard = pool.acquire_for_device("root.sg.d1").unwrap();
+        assert_eq!(guard.current_endpoint(), Some(&ep_b));
+        drop(guard);
+
+        // Unknown device → plain FIFO acquire (the session on A).
+        let guard = pool.acquire_for_device("root.sg.unknown").unwrap();
+        assert_eq!(guard.current_endpoint(), Some(&ep_a));
+    }
+
+    #[test]
+    fn acquire_for_device_falls_back_when_no_session_matches_hint() {
+        let ep_a = fake_listener();
+        let ep_gone = Endpoint::new("10.255.255.1", 6667); // nobody connected here
+
+        let cfg = SessionPoolConfig {
+            max_size: 4,
+            acquire_timeout: Duration::from_millis(50),
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let pool = SessionPool::new(cfg).unwrap();
+        let mut s1 = injected_session(&ep_a);
+        s1.test_inject_redirect_hint("root.sg.d1", ep_gone);
+        pool.inject_idle(s1);
+
+        // Hint exists but no idle session is connected to that endpoint →
+        // normal acquire semantics (FIFO hand-out of s1).
+        let guard = pool.acquire_for_device("root.sg.d1").unwrap();
+        assert_eq!(guard.current_endpoint(), Some(&ep_a));
     }
 
     /// Live-server tests: acquire/release round-trip, reuse, and blocking

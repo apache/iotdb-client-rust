@@ -32,6 +32,7 @@ pub mod protocol;
 
 pub use client::dataset::{Row, SessionDataSet};
 pub use client::pool::{PooledSession, SessionPool, SessionPoolConfig, TableSessionPool};
+pub use client::redirect::{RedirectCache, RedirectCacheStats};
 pub use client::session::{QueryHandle, Session, SessionConfig};
 pub use client::table_session::{TableSession, TableSessionBuilder};
 pub use connection::Endpoint;

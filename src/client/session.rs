@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::client::dataset::SessionDataSet;
+use crate::client::redirect::{self, RedirectCache, RedirectCacheStats};
 use crate::connection::{Connection, Endpoint};
 use crate::data::record::serialize_record_values;
 use crate::data::{Tablet, Value};
@@ -61,6 +62,17 @@ pub struct SessionConfig {
     pub query_timeout_ms: i64,
     /// Database to select at open time (table dialect; sent as config key `db`).
     pub database: Option<String>,
+    /// Reopen the connection and retry an op once when an RPC fails at the
+    /// Thrift/transport level (C# `Reconnect` behavior). Default `true`.
+    pub enable_auto_reconnect: bool,
+    /// Full round-robin passes over the endpoints during a reconnect before
+    /// giving up (C# `RetryNum`). Default 3.
+    pub max_reconnect_attempts: usize,
+    /// Pause between reconnect passes. Default 1 s.
+    pub retry_interval: Duration,
+    /// Harvest status-400 `redirectNode` hints from insert responses into
+    /// the per-session [`RedirectCache`]. Default `true`.
+    pub enable_redirection: bool,
 }
 
 impl Default for SessionConfig {
@@ -75,6 +87,10 @@ impl Default for SessionConfig {
             connect_timeout: Duration::from_secs(10),
             query_timeout_ms: 60_000,
             database: None,
+            enable_auto_reconnect: true,
+            max_reconnect_attempts: 3,
+            retry_interval: Duration::from_secs(1),
+            enable_redirection: true,
         }
     }
 }
@@ -118,6 +134,11 @@ pub struct Session {
     statement_id: i64,
     /// Current database, tracked from `USE <db>` responses (table dialect).
     database: Option<String>,
+    /// Endpoint of the most recent (possibly dead) connection — reconnect
+    /// starts its round-robin here, like the C# SDK.
+    last_endpoint: Option<Endpoint>,
+    /// Device → endpoint hints harvested from status-400 insert responses.
+    redirect_cache: RedirectCache,
 }
 
 impl Session {
@@ -129,6 +150,8 @@ impl Session {
             session_id: -1,
             statement_id: -1,
             database,
+            last_endpoint: None,
+            redirect_cache: RedirectCache::default(),
         }
     }
 
@@ -160,6 +183,19 @@ impl Session {
             last_err.unwrap_or_else(|| Error::Client("no endpoints configured".into()))
         })?;
 
+        let (session_id, statement_id) = self.authenticate(&mut connection)?;
+        self.session_id = session_id;
+        self.statement_id = statement_id;
+        self.last_endpoint = Some(connection.endpoint().clone());
+        self.connection = Some(connection);
+        Ok(())
+    }
+
+    /// Handshake on a fresh connection: `openSession` (dialect + current
+    /// database via the `db` config key) followed by `requestStatementId`.
+    /// Shared by [`Session::open`] and reconnect, so a reopened session
+    /// lands back in the database its `USE <db>` had selected.
+    fn authenticate(&self, connection: &mut Connection) -> Result<(i64, i64)> {
         let mut configuration = BTreeMap::new();
         configuration.insert("sql_dialect".to_string(), self.config.sql_dialect.clone());
         if let Some(db) = &self.database {
@@ -181,14 +217,87 @@ impl Session {
                 resp.server_protocol_version
             );
         }
-        self.session_id = resp
+        let session_id = resp
             .session_id
             .ok_or_else(|| Error::Client("openSession response missing sessionId".into()))?;
-        self.statement_id = connection
-            .client_mut()
-            .request_statement_id(self.session_id)?;
-        self.connection = Some(connection);
-        Ok(())
+        let statement_id = connection.client_mut().request_statement_id(session_id)?;
+        Ok((session_id, statement_id))
+    }
+
+    /// Reopen after a transport-level failure: drop the dead connection
+    /// (closing its transport), then try a **full** handshake — connect +
+    /// openSession + requestStatementId — round-robin over all endpoints,
+    /// starting at the one that just died, for up to
+    /// `max_reconnect_attempts` passes with `retry_interval` between passes
+    /// (mirroring the C# SDK's `Reconnect`).
+    fn reconnect(&mut self) -> Result<()> {
+        self.connection = None; // drop closes the old transport
+        let n = self.config.endpoints.len();
+        if n == 0 {
+            return Err(Error::Client("no endpoints configured".into()));
+        }
+        let start = self
+            .last_endpoint
+            .as_ref()
+            .and_then(|ep| self.config.endpoints.iter().position(|e| e == ep))
+            .unwrap_or(0);
+        let attempts = self.config.max_reconnect_attempts.max(1);
+        let mut last_err: Option<Error> = None;
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                std::thread::sleep(self.config.retry_interval);
+            }
+            for i in 0..n {
+                let endpoint = self.config.endpoints[(start + i) % n].clone();
+                let result = Connection::open(endpoint, self.config.connect_timeout).and_then(
+                    |mut connection| {
+                        let ids = self.authenticate(&mut connection)?;
+                        Ok((connection, ids))
+                    },
+                );
+                match result {
+                    Ok((connection, (session_id, statement_id))) => {
+                        log::info!("reconnected to {}", connection.endpoint());
+                        self.session_id = session_id;
+                        self.statement_id = statement_id;
+                        self.last_endpoint = Some(connection.endpoint().clone());
+                        self.connection = Some(connection);
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::warn!("reconnect attempt {}/{attempts} failed: {e}", attempt + 1);
+                        last_err = Some(e);
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::Client("reconnect failed".into())))
+    }
+
+    /// Run an RPC op; on a transport-level failure ([`Error::Thrift`]) with
+    /// auto-reconnect enabled, reopen the session and retry the op exactly
+    /// once (C# `ExecuteClientOperationAsync`). Server status errors pass
+    /// through untouched. If the reconnect itself fails, the **original**
+    /// error is surfaced. Ops must rebuild their request inside the closure:
+    /// reconnecting swaps the connection and refreshes
+    /// `session_id`/`statement_id`.
+    fn with_retry<T>(&mut self, mut op: impl FnMut(&mut Self) -> Result<T>) -> Result<T> {
+        let original = match op(self) {
+            Err(e @ Error::Thrift(_))
+                if self.config.enable_auto_reconnect && self.connection.is_some() =>
+            {
+                e
+            }
+            other => return other,
+        };
+        log::warn!("RPC failed at transport level ({original}); reconnecting");
+        match self.reconnect() {
+            Ok(()) => op(self),
+            Err(reconnect_err) => {
+                log::warn!("reconnect failed ({reconnect_err}); surfacing the original error");
+                Err(original)
+            }
+        }
     }
 
     pub fn is_open(&self) -> bool {
@@ -200,6 +309,42 @@ impl Session {
         self.database.as_deref()
     }
 
+    /// The endpoint this session is currently connected to, if open.
+    pub fn current_endpoint(&self) -> Option<&Endpoint> {
+        self.connection.as_ref().map(Connection::endpoint)
+    }
+
+    /// The cached redirect endpoint for `device_id`, if a status-400 insert
+    /// response recommended one and the hint has not expired.
+    ///
+    /// The session itself does **not** act on these hints (it holds a
+    /// single connection); [`crate::SessionPool::acquire_for_device`]
+    /// consults them to prefer a matching idle session. See
+    /// [`crate::client::redirect`] for the routing-honesty note.
+    pub fn redirect_hint(&mut self, device_id: &str) -> Option<Endpoint> {
+        self.redirect_cache.get(device_id)
+    }
+
+    /// Occupancy/config snapshot of the redirect cache.
+    pub fn redirect_cache_stats(&self) -> RedirectCacheStats {
+        self.redirect_cache.stats()
+    }
+
+    /// Drop all cached redirect hints.
+    pub fn clear_redirect_cache(&mut self) {
+        self.redirect_cache.clear();
+    }
+
+    /// Inspect an insert response for redirect hints before collapsing it
+    /// into a `Result` — `check_status` treats 400 as plain success and
+    /// would discard the recommended node.
+    fn check_insert_status(&mut self, devices: &[&str], status: &TSStatus) -> Result<()> {
+        if self.config.enable_redirection {
+            redirect::record_redirects(&mut self.redirect_cache, devices, status);
+        }
+        check_status(status)
+    }
+
     fn connection_mut(&mut self) -> Result<&mut Connection> {
         self.connection
             .as_mut()
@@ -209,11 +354,13 @@ impl Session {
     /// Execute a non-query statement (DDL/DML). Tracks `USE <db>` via the
     /// response's `database` field.
     pub fn execute_non_query(&mut self, sql: &str) -> Result<()> {
-        let req = self.statement_req(sql);
-        let resp = self
-            .connection_mut()?
-            .client_mut()
-            .execute_update_statement_v2(req)?;
+        let resp = self.with_retry(|session| {
+            let req = session.statement_req(sql);
+            Ok(session
+                .connection_mut()?
+                .client_mut()
+                .execute_update_statement_v2(req)?)
+        })?;
         check_status(&resp.status)?;
         if let Some(db) = resp.database {
             self.database = Some(db);
@@ -234,11 +381,16 @@ impl Session {
     /// Low-level path: decoding and pagination are the caller's problem —
     /// prefer [`Session::execute_query`].
     pub fn execute_query_raw(&mut self, sql: &str) -> Result<QueryHandle> {
-        let req = self.statement_req(sql);
-        let resp = self
-            .connection_mut()?
-            .client_mut()
-            .execute_query_statement_v2(req)?;
+        // Retry covers only this initial execute RPC: once a query id
+        // exists, the result set is pinned to its node and cannot be
+        // migrated by a reconnect (spec gotcha #13).
+        let resp = self.with_retry(|session| {
+            let req = session.statement_req(sql);
+            Ok(session
+                .connection_mut()?
+                .client_mut()
+                .execute_query_statement_v2(req)?)
+        })?;
         check_status(&resp.status)?;
         let query_id = resp
             .query_id
@@ -354,8 +506,13 @@ impl Session {
             None,
             None,
         );
-        let status = self.connection_mut()?.client_mut().insert_tablet(req)?;
-        check_status(&status)
+        let status = self.with_retry(|session| {
+            // Clone per attempt: a reconnect refreshes the session id.
+            let mut req = req.clone();
+            req.session_id = session.session_id;
+            Ok(session.connection_mut()?.client_mut().insert_tablet(req)?)
+        })?;
+        self.check_insert_status(&[prefix_path], &status)
     }
 
     /// Insert one row for one device via `insertRecord`. `values[i]` pairs
@@ -389,8 +546,12 @@ impl Session {
             None,
             None,
         );
-        let status = self.connection_mut()?.client_mut().insert_record(req)?;
-        check_status(&status)
+        let status = self.with_retry(|session| {
+            let mut req = req.clone();
+            req.session_id = session.session_id;
+            Ok(session.connection_mut()?.client_mut().insert_record(req)?)
+        })?;
+        self.check_insert_status(&[device_id], &status)
     }
 
     /// Insert one row per device via `insertRecords` (multi-device batch).
@@ -449,8 +610,13 @@ impl Session {
             kept_timestamps,
             is_aligned,
         );
-        let status = self.connection_mut()?.client_mut().insert_records(req)?;
-        check_status(&status)
+        let status = self.with_retry(|session| {
+            let mut req = req.clone();
+            req.session_id = session.session_id;
+            Ok(session.connection_mut()?.client_mut().insert_records(req)?)
+        })?;
+        let devices: Vec<&str> = req.prefix_paths.iter().map(String::as_str).collect();
+        self.check_insert_status(&devices, &status)
     }
 
     /// Insert multiple rows for one device via `insertRecordsOfOneDevice`.
@@ -507,11 +673,15 @@ impl Session {
             timestamps,
             is_aligned,
         );
-        let status = self
-            .connection_mut()?
-            .client_mut()
-            .insert_records_of_one_device(req)?;
-        check_status(&status)
+        let status = self.with_retry(|session| {
+            let mut req = req.clone();
+            req.session_id = session.session_id;
+            Ok(session
+                .connection_mut()?
+                .client_mut()
+                .insert_records_of_one_device(req)?)
+        })?;
+        self.check_insert_status(&[device_id], &status)
     }
 
     /// [`Session::insert_record`] against an aligned device
@@ -584,6 +754,23 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.close();
+    }
+}
+
+#[cfg(test)]
+impl Session {
+    /// Test hook: install a raw connection (no handshake) so transport
+    /// failure paths can be exercised without a live server.
+    pub(crate) fn test_inject_connection(&mut self, connection: Connection) {
+        self.last_endpoint = Some(connection.endpoint().clone());
+        self.connection = Some(connection);
+        self.session_id = 1;
+        self.statement_id = 1;
+    }
+
+    /// Test hook: seed a redirect hint as if a status-400 insert had.
+    pub(crate) fn test_inject_redirect_hint(&mut self, device_id: &str, endpoint: Endpoint) {
+        self.redirect_cache.put(device_id, endpoint);
     }
 }
 
@@ -678,6 +865,12 @@ pub fn check_status(status: &TSStatus) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Serializes the live tests that create/delete databases: concurrent
+    /// `DELETE DATABASE` on a small single-node server can transiently
+    /// leave no available DataRegionGroups (server error 906) for other
+    /// tests' inserts.
+    static LIVE_DB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn status(code: i32) -> TSStatus {
         TSStatus::new(code, None, None, None, None, None)
     }
@@ -693,6 +886,10 @@ mod tests {
         assert_eq!(cfg.query_timeout_ms, 60_000);
         assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
         assert!(cfg.database.is_none());
+        assert!(cfg.enable_auto_reconnect);
+        assert_eq!(cfg.max_reconnect_attempts, 3);
+        assert_eq!(cfg.retry_interval, Duration::from_secs(1));
+        assert!(cfg.enable_redirection);
     }
 
     #[test]
@@ -872,6 +1069,106 @@ mod tests {
     }
 
     #[test]
+    fn insert_status_records_redirect_hint() {
+        use crate::protocol::common::TEndPoint;
+        let mut session = Session::new(SessionConfig::default());
+        let mut s = status(400);
+        s.redirect_node = Some(TEndPoint::new("10.1.1.1".to_string(), 6667));
+        // Status 400 is still a successful write…
+        assert!(session.check_insert_status(&["root.sg.d1"], &s).is_ok());
+        // …and its redirect node is now cached for the device.
+        assert_eq!(
+            session.redirect_hint("root.sg.d1"),
+            Some(Endpoint::new("10.1.1.1", 6667))
+        );
+        assert_eq!(session.redirect_hint("root.sg.other"), None);
+        assert_eq!(session.redirect_cache_stats().size, 1);
+        session.clear_redirect_cache();
+        assert_eq!(session.redirect_hint("root.sg.d1"), None);
+
+        // With redirection disabled nothing is recorded (but 400 still OK).
+        let mut session = Session::new(SessionConfig {
+            enable_redirection: false,
+            ..Default::default()
+        });
+        assert!(session.check_insert_status(&["root.sg.d1"], &s).is_ok());
+        assert_eq!(session.redirect_hint("root.sg.d1"), None);
+    }
+
+    /// Accept-then-drop listener: TCP connects succeed, but every RPC on
+    /// the connection dies at the Thrift level. Returns the endpoint and a
+    /// shared accept counter (the acceptor thread is leaked; it ends with
+    /// the test process).
+    fn accept_then_drop_listener() -> (Endpoint, std::sync::Arc<AtomicUsize>) {
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let counter = accepts.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        drop(s); // immediate close ⇒ peer reads EOF
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (Endpoint::new("127.0.0.1", port), accepts)
+    }
+
+    /// A transport-level RPC failure with auto-reconnect enabled must drive
+    /// `max_reconnect_attempts` full reconnect passes (visible as fresh TCP
+    /// connects) and, when they all fail, surface the **original** error.
+    #[test]
+    fn transport_failure_reconnects_then_surfaces_original_error() {
+        let (endpoint, accepts) = accept_then_drop_listener();
+        let mut session = Session::new(SessionConfig {
+            endpoints: vec![endpoint.clone()],
+            connect_timeout: Duration::from_millis(500),
+            max_reconnect_attempts: 2,
+            retry_interval: Duration::from_millis(10),
+            ..Default::default()
+        });
+        let connection = Connection::open(endpoint.clone(), Duration::from_millis(500)) //
+            .expect("connect to listener");
+        session.test_inject_connection(connection);
+        assert_eq!(session.current_endpoint(), Some(&endpoint));
+
+        let err = session.execute_non_query("SHOW DATABASES").unwrap_err();
+        assert!(matches!(err, Error::Thrift(_)), "got {err:?}");
+        // 1 initial connection + 2 reconnect passes × 1 endpoint. Each
+        // failed openSession implies its connection was accepted+dropped,
+        // so the counter is settled once the error is back.
+        assert_eq!(accepts.load(Ordering::SeqCst), 3);
+        // The failed reconnect left the session without a connection.
+        assert!(!session.is_open());
+    }
+
+    /// With auto-reconnect disabled the op fails once: no reconnect
+    /// connects, original error surfaced directly.
+    #[test]
+    fn no_reconnect_when_disabled() {
+        let (endpoint, accepts) = accept_then_drop_listener();
+        let mut session = Session::new(SessionConfig {
+            endpoints: vec![endpoint.clone()],
+            connect_timeout: Duration::from_millis(500),
+            enable_auto_reconnect: false,
+            ..Default::default()
+        });
+        let connection = Connection::open(endpoint, Duration::from_millis(500)) //
+            .expect("connect to listener");
+        session.test_inject_connection(connection);
+
+        let err = session.execute_non_query("SHOW DATABASES").unwrap_err();
+        assert!(matches!(err, Error::Thrift(_)), "got {err:?}");
+        assert_eq!(accepts.load(Ordering::SeqCst), 1, "no reconnect attempts");
+    }
+
+    #[test]
     fn open_without_endpoints_fails() {
         let mut session = Session::new(SessionConfig {
             endpoints: vec![],
@@ -935,6 +1232,7 @@ mod tests {
         }
 
         const DB: &str = "root.rusttest_date";
+        let _guard = LIVE_DB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         // 2026-07-13 as yyyyMMdd; deliberately not near epoch so a
         // days-since-epoch misinterpretation cannot coincide.
         const DATE_YYYYMMDD: i32 = 20260713;
@@ -994,6 +1292,87 @@ mod tests {
         session.close().expect("close session");
     }
 
+    /// V3 regression: with auto-reconnect and redirection at their default
+    /// (enabled) settings, normal write/read ops behave exactly as before.
+    /// On a single-node server no status 400 is ever issued, so the
+    /// redirect cache must stay empty. Skipped when no IoTDB instance is
+    /// reachable on localhost:6667.
+    #[test]
+    fn live_ops_with_retry_and_redirection_enabled() {
+        use crate::data::{tablet::Tablet, TSDataType, Value};
+        use std::net::TcpStream;
+        if TcpStream::connect_timeout(
+            &"127.0.0.1:6667".parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_err()
+        {
+            eprintln!(
+                "skipping live_ops_with_retry_and_redirection_enabled: \
+                 no IoTDB server on 127.0.0.1:6667"
+            );
+            return;
+        }
+
+        const DB: &str = "root.rusttest_retry";
+        let _guard = LIVE_DB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let cfg = SessionConfig::default();
+        assert!(cfg.enable_auto_reconnect && cfg.enable_redirection);
+
+        let mut session = Session::new(cfg);
+        session.open().expect("open session");
+        assert_eq!(
+            session.current_endpoint(),
+            Some(&Endpoint::new("localhost", 6667))
+        );
+
+        let _ = session.execute_non_query(&format!("DELETE DATABASE {DB}"));
+        session
+            .execute_non_query(&format!("CREATE DATABASE {DB}"))
+            .expect("create database");
+
+        // Tablet + record inserts, both passing through check_insert_status.
+        let mut tablet = Tablet::new(
+            format!("{DB}.d1"),
+            vec!["v".into()],
+            vec![TSDataType::Int32],
+        )
+        .expect("tablet");
+        tablet
+            .add_row(1, vec![Some(Value::Int32(7))])
+            .expect("add_row");
+        session.insert_tablet(&tablet).expect("insert_tablet");
+        session
+            .insert_record(
+                &format!("{DB}.d1"),
+                2,
+                vec!["v".into()],
+                &[Value::Int32(8)],
+                false,
+            )
+            .expect("insert_record");
+
+        // Single node ⇒ the server never recommends a redirect.
+        assert_eq!(session.redirect_cache_stats().size, 0);
+        assert_eq!(session.redirect_hint(&format!("{DB}.d1")), None);
+
+        let mut rows = 0;
+        {
+            let mut dataset = session
+                .execute_query(&format!("SELECT v FROM {DB}.d1"))
+                .expect("query");
+            while dataset.next_row().expect("next_row").is_some() {
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 2);
+
+        session
+            .execute_non_query(&format!("DELETE DATABASE {DB}"))
+            .expect("cleanup");
+        session.close().expect("close session");
+    }
+
     /// Value-asserting live roundtrip: unsorted input, nulls, and a row count
     /// that is a multiple of 8 (stresses the rows/8+1 bitmap padding byte).
     /// Skipped when no IoTDB instance is reachable on localhost:6667.
@@ -1012,6 +1391,7 @@ mod tests {
         }
 
         const DB: &str = "root.rusttest_readback";
+        let _guard = LIVE_DB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         const ROWS: i64 = 16;
 
         let mut session = Session::new(SessionConfig::default());
@@ -1116,6 +1496,7 @@ mod tests {
         }
 
         const DB: &str = "root.rusttest_records";
+        let _guard = LIVE_DB_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
         let read_rows = |session: &mut Session, sql: &str| -> Vec<(i64, Vec<Value>)> {
             let mut rows = Vec::new();

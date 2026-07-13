@@ -21,10 +21,12 @@
 
 pub mod dataset;
 pub mod pool;
+pub mod redirect;
 pub mod session;
 pub mod table_session;
 
 pub use dataset::{Row, SessionDataSet};
 pub use pool::{PooledSession, SessionPool, SessionPoolConfig, TableSessionPool};
+pub use redirect::{RedirectCache, RedirectCacheStats};
 pub use session::{QueryHandle, Session, SessionConfig};
 pub use table_session::{TableSession, TableSessionBuilder};
