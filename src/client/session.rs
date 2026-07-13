@@ -542,6 +542,88 @@ mod tests {
         assert!(!session.is_open());
     }
 
+    /// DATE wire-format adjudication test (goal V1). Inserts one DATE row via
+    /// the tablet binary path (i32 yyyyMMdd) and one via a SQL date literal
+    /// (parsed server-side), then reads both back: if the tablet encoding is
+    /// correct, both rows decode to the same i32 for the same calendar date.
+    /// This breaks the write-read circularity a plain roundtrip would have.
+    /// Skipped when no IoTDB instance is reachable on localhost:6667.
+    #[test]
+    fn live_date_encoding_adjudication() {
+        use crate::data::{tablet::Tablet, TSDataType, Value};
+        use std::net::TcpStream;
+        if TcpStream::connect_timeout(
+            &"127.0.0.1:6667".parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_err()
+        {
+            eprintln!(
+                "skipping live_date_encoding_adjudication: no IoTDB server on 127.0.0.1:6667"
+            );
+            return;
+        }
+
+        const DB: &str = "root.rusttest_date";
+        // 2026-07-13 as yyyyMMdd; deliberately not near epoch so a
+        // days-since-epoch misinterpretation cannot coincide.
+        const DATE_YYYYMMDD: i32 = 20260713;
+
+        let mut session = Session::new(SessionConfig::default());
+        session.open().expect("open session");
+        let _ = session.execute_non_query(&format!("DELETE DATABASE {DB}"));
+        session
+            .execute_non_query(&format!("CREATE DATABASE {DB}"))
+            .expect("create database");
+
+        // Row at ts=1: tablet binary path.
+        let mut tablet = Tablet::new(
+            format!("{DB}.d1"),
+            vec!["dt".into()],
+            vec![TSDataType::Date],
+        )
+        .expect("tablet");
+        tablet
+            .add_row(1, vec![Some(Value::Date(DATE_YYYYMMDD))])
+            .expect("add_row");
+        session.insert_tablet(&tablet).expect("insert_tablet");
+
+        // Row at ts=2: SQL literal path — server parses the calendar date itself.
+        session
+            .execute_non_query(&format!(
+                "INSERT INTO {DB}.d1(timestamp, dt) VALUES (2, '2026-07-13')"
+            ))
+            .expect("insert via SQL literal");
+
+        // Read both back; they must decode identically.
+        let mut got: Vec<(i64, Value)> = Vec::new();
+        {
+            let mut dataset = session
+                .execute_query(&format!("SELECT dt FROM {DB}.d1 ORDER BY time"))
+                .expect("query");
+            while let Some(row) = dataset.next_row().expect("next_row") {
+                got.push((row.timestamp.expect("timestamp"), row.values[0].clone()));
+            }
+        }
+        assert_eq!(got.len(), 2, "expected both rows back");
+        assert_eq!(
+            got[0].1,
+            Value::Date(DATE_YYYYMMDD),
+            "tablet-path DATE readback"
+        );
+        assert_eq!(
+            got[1].1,
+            Value::Date(DATE_YYYYMMDD),
+            "SQL-literal DATE must decode to the same i32 as the tablet path — \
+             proves yyyyMMdd is the server's wire semantics"
+        );
+
+        session
+            .execute_non_query(&format!("DELETE DATABASE {DB}"))
+            .expect("cleanup");
+        session.close().expect("close session");
+    }
+
     /// Value-asserting live roundtrip: unsorted input, nulls, and a row count
     /// that is a multiple of 8 (stresses the rows/8+1 bitmap padding byte).
     /// Skipped when no IoTDB instance is reachable on localhost:6667.

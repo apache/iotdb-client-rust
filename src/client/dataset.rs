@@ -173,10 +173,27 @@ impl<'a> SessionDataSet<'a> {
                         block.columns.len()
                     ))
                 })?;
-            values.push(column[i].clone());
+            values.push(Self::apply_logical_type(
+                column[i].clone(),
+                self.data_type_list.get(ordinal).map(String::as_str),
+            ));
         }
         let timestamp = (!self.ignore_time_stamp).then(|| block.timestamps[i]);
         Ok(Row { timestamp, values })
+    }
+
+    /// Re-tag a decoded value with the column's logical type from the
+    /// response's `dataTypeList`. TsBlock headers carry the *physical* type
+    /// (DATE arrives as INT32, TIMESTAMP as INT64, STRING as TEXT), so the
+    /// block decoder alone cannot distinguish them.
+    fn apply_logical_type(value: Value, logical: Option<&str>) -> Value {
+        match (logical, value) {
+            (Some("DATE"), Value::Int32(v)) => Value::Date(v),
+            (Some("TIMESTAMP"), Value::Int64(v)) => Value::Timestamp(v),
+            (Some("STRING"), Value::Text(s)) => Value::String(s),
+            (Some("BLOB"), Value::Text(s)) => Value::Blob(s.into_bytes()),
+            (_, v) => v,
+        }
     }
 
     /// Close the query (best-effort `closeOperation`, errors swallowed) and
@@ -224,6 +241,47 @@ mod tests {
             more_data,
             column_index2_ts_block_column_index_list: None,
         }
+    }
+
+    #[test]
+    fn logical_type_retagging_from_data_type_list() {
+        // DATE arrives physically as INT32 in the TsBlock; dataTypeList says DATE.
+        let mut session = offline_session();
+        let mut h = handle(vec![int32_block(&[1], &[20260713])], false);
+        h.data_type_list = vec!["DATE".into()];
+        let mut ds = SessionDataSet::new(&mut session, h);
+        let row = ds.next_row().unwrap().unwrap();
+        assert_eq!(row.values[0], Value::Date(20260713));
+        assert!(ds.next_row().unwrap().is_none());
+    }
+
+    #[test]
+    fn apply_logical_type_variants() {
+        use Value::*;
+        // Physical → logical re-tags.
+        assert_eq!(
+            SessionDataSet::apply_logical_type(Int32(20260713), Some("DATE")),
+            Date(20260713)
+        );
+        assert_eq!(
+            SessionDataSet::apply_logical_type(Int64(99), Some("TIMESTAMP")),
+            Timestamp(99)
+        );
+        assert_eq!(
+            SessionDataSet::apply_logical_type(Text("s".into()), Some("STRING")),
+            String("s".into())
+        );
+        assert_eq!(
+            SessionDataSet::apply_logical_type(Text("b".into()), Some("BLOB")),
+            Blob(b"b".to_vec())
+        );
+        // Pass-throughs: matching physical types and nulls stay untouched.
+        assert_eq!(
+            SessionDataSet::apply_logical_type(Int32(5), Some("INT32")),
+            Int32(5)
+        );
+        assert_eq!(SessionDataSet::apply_logical_type(Null, Some("DATE")), Null);
+        assert_eq!(SessionDataSet::apply_logical_type(Int32(5), None), Int32(5));
     }
 
     #[test]
