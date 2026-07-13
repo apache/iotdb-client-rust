@@ -71,6 +71,15 @@ pub struct TlsOptions {
     /// Hostname used for SNI + certificate validation instead of the
     /// endpoint host (e.g. when connecting by IP).
     pub domain_override: Option<String>,
+    /// PEM client certificate for mutual TLS (server has
+    /// `thrift_ssl_client_auth=true`). Must be set together with
+    /// [`client_key_path`](Self::client_key_path); mirrors the Node.js
+    /// `sslOptions.cert`.
+    pub client_cert_path: Option<std::path::PathBuf>,
+    /// PEM PKCS#8 private key for the client certificate. Must be set
+    /// together with [`client_cert_path`](Self::client_cert_path); mirrors
+    /// the Node.js `sslOptions.key`.
+    pub client_key_path: Option<std::path::PathBuf>,
 }
 
 /// How to open a [`Connection`]: timeout, wire protocol, optional TLS.
@@ -272,6 +281,30 @@ fn tls_handshake(
     if tls.accept_invalid_certs {
         builder.danger_accept_invalid_certs(true);
     }
+    match (&tls.client_cert_path, &tls.client_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            let cert = std::fs::read(cert_path).map_err(|e| {
+                Error::Client(format!(
+                    "cannot read client certificate {}: {e}",
+                    cert_path.display()
+                ))
+            })?;
+            let key = std::fs::read(key_path).map_err(|e| {
+                Error::Client(format!(
+                    "cannot read client key {}: {e}",
+                    key_path.display()
+                ))
+            })?;
+            let identity = native_tls::Identity::from_pkcs8(&cert, &key).map_err(Error::Tls)?;
+            builder.identity(identity);
+        }
+        (None, None) => {}
+        _ => {
+            return Err(Error::Client(
+                "mutual TLS requires both client_cert_path and client_key_path".into(),
+            ))
+        }
+    }
     let connector = builder.build().map_err(Error::Tls)?;
     let domain = tls.domain_override.as_deref().unwrap_or(&endpoint.host);
     connector.connect(domain, stream).map_err(|e| match e {
@@ -396,7 +429,7 @@ mod tests {
 
     /// A local listener that accepts and immediately drops connections, so
     /// `Connection::open` (which issues no RPC) succeeds for any protocol.
-    fn accept_then_drop_listener() -> Endpoint {
+    pub(super) fn accept_then_drop_listener() -> Endpoint {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("local_addr").port();
         std::thread::spawn(move || {
@@ -408,6 +441,51 @@ mod tests {
             }
         });
         Endpoint::new("127.0.0.1", port)
+    }
+
+    /// A local listener that accepts one connection, reports the first byte
+    /// the client puts on the wire, then closes (unblocking the client with
+    /// an EOF/reset). Lets tests assert *which* stack touched the socket:
+    /// a TLS ClientHello starts with the handshake record type `0x16`, a
+    /// plain Thrift framed message with the frame-length MSB `0x00`.
+    pub(super) fn first_byte_listener() -> (Endpoint, std::sync::mpsc::Receiver<u8>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut byte = [0u8; 1];
+                if stream.read_exact(&mut byte).is_ok() {
+                    let _ = tx.send(byte[0]);
+                }
+            }
+        });
+        (Endpoint::new("127.0.0.1", port), rx)
+    }
+
+    /// Dispatch (Node.js `Connection.test.ts` analogue): without TLS the
+    /// plain TCP stack talks to the socket — the first wire byte of an RPC
+    /// is the framed-transport length MSB (`0x00`), not a TLS ClientHello
+    /// record type (`0x16`).
+    #[test]
+    fn plain_dispatch_writes_thrift_frame_not_tls() {
+        use crate::protocol::client::TIClientRPCServiceSyncClient;
+
+        let (endpoint, first_byte) = first_byte_listener();
+        #[allow(clippy::needless_update)]
+        let options = ConnectionOptions {
+            connect_timeout: Duration::from_millis(500),
+            protocol: RpcProtocol::Binary,
+            ..Default::default()
+        };
+        let mut connection = Connection::open(endpoint, &options).expect("plain open");
+        // The RPC itself fails once the listener closes after one byte —
+        // only the bytes it managed to put on the wire matter here.
+        let _ = connection.client_mut().request_statement_id(1);
+        let byte = first_byte
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first wire byte");
+        assert_eq!(byte, 0x00, "expected framed length MSB, got 0x{byte:02x}");
     }
 
     /// Both protocol variants construct their transport/protocol stack and
@@ -482,6 +560,7 @@ mod tls_tests {
                 ca_cert_path: Some(fixture("cert.pem")),
                 accept_invalid_certs: false,
                 domain_override: Some("localhost".into()),
+                ..Default::default()
             }),
         };
         let mut connection = Connection::open(endpoint, &options).expect("TLS handshake");
@@ -508,6 +587,7 @@ mod tls_tests {
                 ca_cert_path: None,
                 accept_invalid_certs: false,
                 domain_override: Some("localhost".into()),
+                ..Default::default()
             }),
         };
         let err = match Connection::open(endpoint, &options) {
@@ -532,6 +612,166 @@ mod tls_tests {
         };
         let connection = Connection::open(endpoint, &options).expect("TLS handshake");
         assert_eq!(connection.protocol(), RpcProtocol::Compact);
+    }
+
+    /// Dispatch (Node.js `Connection.test.ts` analogue), TLS side: with
+    /// `tls: Some(..)` the first wire byte is the TLS handshake record type
+    /// `0x16` (ClientHello) — the plain Thrift stack never touches the
+    /// socket. The listener is not a TLS server, so `open` itself fails.
+    #[test]
+    fn tls_dispatch_sends_client_hello() {
+        let (endpoint, first_byte) = super::tests::first_byte_listener();
+        let options = ConnectionOptions {
+            connect_timeout: Duration::from_millis(500),
+            protocol: RpcProtocol::Binary,
+            tls: Some(TlsOptions {
+                accept_invalid_certs: true,
+                ..Default::default()
+            }),
+        };
+        assert!(
+            Connection::open(endpoint, &options).is_err(),
+            "plain listener is not a TLS server"
+        );
+        let byte = first_byte
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first wire byte");
+        assert_eq!(
+            byte, 0x16,
+            "expected TLS handshake record type, got 0x{byte:02x}"
+        );
+    }
+
+    /// Dispatch pair against the *same kind* of plain (non-TLS) endpoint:
+    /// `tls: None` opens fine (plain TCP), `tls: Some(..)` — even with
+    /// certificate verification disabled — dies in the handshake with a
+    /// TLS error. Together with the ClientHello byte check this proves the
+    /// `tls` option selects the code path, mirroring the Node.js test that
+    /// asserts the SSL constructor is (not) called.
+    #[test]
+    fn tls_option_selects_stack_against_plain_endpoint() {
+        let endpoint = super::tests::accept_then_drop_listener();
+
+        let plain = ConnectionOptions {
+            connect_timeout: Duration::from_millis(500),
+            protocol: RpcProtocol::Binary,
+            tls: None,
+        };
+        Connection::open(endpoint.clone(), &plain).expect("plain open against plain listener");
+
+        let tls = ConnectionOptions {
+            connect_timeout: Duration::from_millis(500),
+            protocol: RpcProtocol::Binary,
+            tls: Some(TlsOptions {
+                accept_invalid_certs: true,
+                ..Default::default()
+            }),
+        };
+        let err = match Connection::open(endpoint, &tls) {
+            Ok(_) => panic!("TLS handshake against a plain endpoint must fail"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::Tls(_)), "got {err:?}");
+    }
+
+    /// Mutual TLS: a PEM client certificate + PKCS#8 key load into an
+    /// identity and the handshake completes with the identity configured.
+    /// `native-tls`'s `TlsAcceptor` has no API to *request* a client
+    /// certificate, so the loopback server cannot verify it — acceptor-side
+    /// client-auth is exercised only by the live `IOTDB_TLS_URL` test
+    /// against a real server.
+    #[test]
+    fn tls_client_identity_handshake_succeeds() {
+        let endpoint = tls_acceptor_once();
+        let options = ConnectionOptions {
+            connect_timeout: Duration::from_millis(500),
+            protocol: RpcProtocol::Binary,
+            tls: Some(TlsOptions {
+                ca_cert_path: Some(fixture("cert.pem")),
+                domain_override: Some("localhost".into()),
+                client_cert_path: Some(fixture("client-cert.pem")),
+                client_key_path: Some(fixture("client-key.pem")),
+                ..Default::default()
+            }),
+        };
+        let connection = Connection::open(endpoint, &options).expect("TLS handshake with identity");
+        assert_eq!(connection.protocol(), RpcProtocol::Binary);
+    }
+
+    /// Setting only one of the client cert/key pair is a config error
+    /// caught before any I/O.
+    #[test]
+    fn tls_client_identity_requires_both_paths() {
+        let endpoint = tls_acceptor_once();
+        for (cert, key) in [
+            (Some(fixture("client-cert.pem")), None),
+            (None, Some(fixture("client-key.pem"))),
+        ] {
+            let options = ConnectionOptions {
+                connect_timeout: Duration::from_millis(500),
+                protocol: RpcProtocol::Binary,
+                tls: Some(TlsOptions {
+                    accept_invalid_certs: true,
+                    client_cert_path: cert.clone(),
+                    client_key_path: key.clone(),
+                    ..Default::default()
+                }),
+            };
+            let err = match Connection::open(endpoint.clone(), &options) {
+                Ok(_) => panic!("half a client identity must fail"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(&err, Error::Client(m) if m.contains("mutual TLS")),
+                "cert={cert:?} key={key:?}: got {err:?}"
+            );
+        }
+    }
+
+    /// A missing client key file is a clear client error before any connect.
+    #[test]
+    fn tls_missing_client_key_file_is_client_error() {
+        let endpoint = tls_acceptor_once();
+        let options = ConnectionOptions {
+            connect_timeout: Duration::from_millis(500),
+            protocol: RpcProtocol::Binary,
+            tls: Some(TlsOptions {
+                accept_invalid_certs: true,
+                client_cert_path: Some(fixture("client-cert.pem")),
+                client_key_path: Some(fixture("does-not-exist-key.pem")),
+                ..Default::default()
+            }),
+        };
+        let err = match Connection::open(endpoint, &options) {
+            Ok(_) => panic!("missing client key must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(&err, Error::Client(m) if m.contains("cannot read client key")),
+            "got {err:?}"
+        );
+    }
+
+    /// A file that is not a PKCS#8 key (here: the certificate itself) fails
+    /// identity construction with a TLS error, not a panic.
+    #[test]
+    fn tls_corrupt_client_key_is_tls_error() {
+        let endpoint = tls_acceptor_once();
+        let options = ConnectionOptions {
+            connect_timeout: Duration::from_millis(500),
+            protocol: RpcProtocol::Binary,
+            tls: Some(TlsOptions {
+                accept_invalid_certs: true,
+                client_cert_path: Some(fixture("client-cert.pem")),
+                client_key_path: Some(fixture("client-cert.pem")), // not a key
+                ..Default::default()
+            }),
+        };
+        let err = match Connection::open(endpoint, &options) {
+            Ok(_) => panic!("a certificate is not a private key"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::Tls(_)), "got {err:?}");
     }
 
     /// A missing CA file is a clear client error before any connect.

@@ -1,2 +1,4 @@
 /target
 Cargo.lock
+# derived from cert.pem/key.pem for the live TLS test — see tests/fixtures/tls/README.md
+tests/fixtures/tls/server-keystore.p12

@@ -200,7 +200,20 @@ let config = SessionConfig {
 // or: TableSession::builder().use_ssl(true).ca_cert_path("ca.pem")...
 ```
 
-The server needs Thrift SSL enabled (`enable_thrift_ssl=true` + key store). Pool configs pass both options through their embedded `session` config.
+For **mutual TLS** (server has `thrift_ssl_client_auth=true`), add a PEM client certificate and its PKCS#8 key — the analogue of the Node.js `sslOptions.cert`/`sslOptions.key`:
+
+```rust
+let config = SessionConfig {
+    use_ssl: true,
+    ca_cert_path: Some("ca.pem".into()),
+    client_cert_path: Some("client.crt".into()),  // must be set together
+    client_key_path: Some("client.key".into()),   // with client_cert_path
+    ..Default::default()
+};
+// or: TableSession::builder().use_ssl(true).client_cert_path("client.crt").client_key_path("client.key")...
+```
+
+The server needs Thrift SSL enabled (`enable_thrift_ssl=true` + key store; see `tests/fixtures/tls/README.md` for a throwaway docker setup). Pool configs pass all options through their embedded `session` config.
 
 ## Thrift codegen
 

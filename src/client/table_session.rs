@@ -144,6 +144,22 @@ impl TableSessionBuilder {
         self
     }
 
+    /// PEM client certificate for mutual TLS; set together with
+    /// [`client_key_path`](Self::client_key_path) (cargo feature `tls`).
+    #[cfg(feature = "tls")]
+    pub fn client_cert_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.config.client_cert_path = Some(path.into());
+        self
+    }
+
+    /// PEM PKCS#8 private key for the client certificate; set together with
+    /// [`client_cert_path`](Self::client_cert_path) (cargo feature `tls`).
+    #[cfg(feature = "tls")]
+    pub fn client_key_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.config.client_key_path = Some(path.into());
+        self
+    }
+
     /// The [`SessionConfig`] this builder resolves to (dialect always
     /// `"table"`).
     pub fn config(&self) -> &SessionConfig {
@@ -249,12 +265,22 @@ mod tests {
                 .use_ssl(true)
                 .ca_cert_path("/certs/ca.pem")
                 .accept_invalid_certs(true)
-                .domain_override("iotdb.internal");
+                .domain_override("iotdb.internal")
+                .client_cert_path("/certs/client.pem")
+                .client_key_path("/certs/client-key.pem");
             let cfg = b.config();
             assert!(cfg.use_ssl);
             assert_eq!(cfg.ca_cert_path.as_deref(), Some("/certs/ca.pem".as_ref()));
             assert!(cfg.accept_invalid_certs);
             assert_eq!(cfg.domain_override.as_deref(), Some("iotdb.internal"));
+            assert_eq!(
+                cfg.client_cert_path.as_deref(),
+                Some("/certs/client.pem".as_ref())
+            );
+            assert_eq!(
+                cfg.client_key_path.as_deref(),
+                Some("/certs/client-key.pem".as_ref())
+            );
         }
     }
 

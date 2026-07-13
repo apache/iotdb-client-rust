@@ -200,7 +200,20 @@ let config = SessionConfig {
 // 或：TableSession::builder().use_ssl(true).ca_cert_path("ca.pem")...
 ```
 
-服务端需开启 Thrift SSL（`enable_thrift_ssl=true` + 密钥库）。连接池配置通过其内嵌的 `session` 配置透传这两组选项。
+**双向 TLS**（服务端 `thrift_ssl_client_auth=true`）需额外提供 PEM 客户端证书及其 PKCS#8 私钥 —— 对应 Node.js 的 `sslOptions.cert`/`sslOptions.key`：
+
+```rust
+let config = SessionConfig {
+    use_ssl: true,
+    ca_cert_path: Some("ca.pem".into()),
+    client_cert_path: Some("client.crt".into()),  // 必须与 client_key_path
+    client_key_path: Some("client.key".into()),   // 同时设置
+    ..Default::default()
+};
+// 或：TableSession::builder().use_ssl(true).client_cert_path("client.crt").client_key_path("client.key")...
+```
+
+服务端需开启 Thrift SSL（`enable_thrift_ssl=true` + 密钥库；一次性 docker 环境见 `tests/fixtures/tls/README.md`）。连接池配置通过其内嵌的 `session` 配置透传全部选项。
 
 ## Thrift 代码生成
 

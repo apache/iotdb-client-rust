@@ -95,6 +95,15 @@ pub struct SessionConfig {
     /// host (e.g. when connecting by IP).
     #[cfg(feature = "tls")]
     pub domain_override: Option<String>,
+    /// PEM client certificate for mutual TLS (server has
+    /// `thrift_ssl_client_auth=true`); set together with
+    /// `client_key_path`. Mirrors the Node.js `sslOptions.cert`.
+    #[cfg(feature = "tls")]
+    pub client_cert_path: Option<std::path::PathBuf>,
+    /// PEM PKCS#8 private key for the client certificate; set together
+    /// with `client_cert_path`. Mirrors the Node.js `sslOptions.key`.
+    #[cfg(feature = "tls")]
+    pub client_key_path: Option<std::path::PathBuf>,
 }
 
 impl Default for SessionConfig {
@@ -122,6 +131,10 @@ impl Default for SessionConfig {
             accept_invalid_certs: false,
             #[cfg(feature = "tls")]
             domain_override: None,
+            #[cfg(feature = "tls")]
+            client_cert_path: None,
+            #[cfg(feature = "tls")]
+            client_key_path: None,
         }
     }
 }
@@ -152,6 +165,8 @@ impl SessionConfig {
                 ca_cert_path: self.ca_cert_path.clone(),
                 accept_invalid_certs: self.accept_invalid_certs,
                 domain_override: self.domain_override.clone(),
+                client_cert_path: self.client_cert_path.clone(),
+                client_key_path: self.client_key_path.clone(),
             }),
         }
     }
@@ -1027,6 +1042,8 @@ mod tests {
             assert!(cfg.ca_cert_path.is_none());
             assert!(!cfg.accept_invalid_certs);
             assert!(cfg.domain_override.is_none());
+            assert!(cfg.client_cert_path.is_none());
+            assert!(cfg.client_key_path.is_none());
         }
     }
 
@@ -1056,12 +1073,42 @@ mod tests {
                 ca_cert_path: Some("/certs/ca.pem".into()),
                 accept_invalid_certs: true,
                 domain_override: Some("iotdb.internal".into()),
+                client_cert_path: Some("/certs/client.pem".into()),
+                client_key_path: Some("/certs/client-key.pem".into()),
                 ..Default::default()
             };
             let tls = cfg.connection_options().tls.expect("tls options");
             assert_eq!(tls.ca_cert_path.as_deref(), Some("/certs/ca.pem".as_ref()));
             assert!(tls.accept_invalid_certs);
             assert_eq!(tls.domain_override.as_deref(), Some("iotdb.internal"));
+            assert_eq!(
+                tls.client_cert_path.as_deref(),
+                Some("/certs/client.pem".as_ref())
+            );
+            assert_eq!(
+                tls.client_key_path.as_deref(),
+                Some("/certs/client-key.pem".as_ref())
+            );
+
+            // Protocol × TLS are independent axes: every combination maps
+            // through, ConnectionOptions carries both.
+            for (compression, ssl) in [(false, false), (false, true), (true, false), (true, true)] {
+                let cfg = SessionConfig {
+                    enable_rpc_compression: compression,
+                    use_ssl: ssl,
+                    ..Default::default()
+                };
+                let options = cfg.connection_options();
+                assert_eq!(
+                    options.protocol,
+                    if compression {
+                        RpcProtocol::Compact
+                    } else {
+                        RpcProtocol::Binary
+                    }
+                );
+                assert_eq!(options.tls.is_some(), ssl);
+            }
         }
     }
 
@@ -1598,11 +1645,49 @@ mod tests {
             use_ssl: true,
             ca_cert_path: std::env::var_os("IOTDB_TLS_CA").map(Into::into),
             accept_invalid_certs: std::env::var_os("IOTDB_TLS_INSECURE").is_some(),
+            domain_override: std::env::var("IOTDB_TLS_DOMAIN").ok(),
+            // A client identity is only *verified* by a server with
+            // thrift_ssl_client_auth=true (not available in 2.0.6, whose
+            // RPC service hardcodes requireClientAuth(false)); setting these
+            // against any TLS server still proves the identity loads and
+            // the handshake tolerates it.
+            client_cert_path: std::env::var_os("IOTDB_TLS_CLIENT_CERT").map(Into::into),
+            client_key_path: std::env::var_os("IOTDB_TLS_CLIENT_KEY").map(Into::into),
             ..Default::default()
         });
         session.open().expect("open TLS session");
-        let mut dataset = session.execute_query("SHOW DATABASES").expect("query");
-        while dataset.next_row().expect("next_row").is_some() {}
+
+        // Full write+read roundtrip over the TLS transport, not just a
+        // metadata query.
+        const DB: &str = "root.rusttest_tls";
+        let _ = session.execute_non_query(&format!("DELETE DATABASE {DB}"));
+        session
+            .execute_non_query(&format!("CREATE DATABASE {DB}"))
+            .expect("create database");
+        session
+            .execute_non_query(&format!(
+                "CREATE TIMESERIES {DB}.d1.s1 WITH DATATYPE=INT32, ENCODING=PLAIN"
+            ))
+            .expect("create timeseries");
+        session
+            .execute_non_query(&format!(
+                "INSERT INTO {DB}.d1(timestamp, s1) VALUES (1, 42)"
+            ))
+            .expect("insert");
+        let mut rows = Vec::new();
+        {
+            let mut dataset = session
+                .execute_query(&format!("SELECT s1 FROM {DB}.d1"))
+                .expect("query");
+            while let Some(row) = dataset.next_row().expect("next_row") {
+                rows.push((row.timestamp.expect("timestamp"), row.values[0].clone()));
+            }
+        }
+        assert_eq!(rows, [(1, crate::data::Value::Int32(42))]);
+        session
+            .execute_non_query(&format!("DELETE DATABASE {DB}"))
+            .expect("cleanup");
+        session.close().expect("close session");
     }
 
     /// DATE wire-format adjudication test (goal V1). Inserts one DATE row via
