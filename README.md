@@ -253,7 +253,9 @@ cargo test             # now includes the live-server tests
 
 ## Benchmark
 
-`examples/benchmark.rs` is a write-performance benchmark modeled on the Node.js client's `benchmark/` suite (which follows [thulab/iot-benchmark](https://github.com/thulab/iot-benchmark)); metric definitions match, so results are comparable across the SDKs. Tablets are pre-generated outside the timed section; N worker threads each own a pooled session and insert `insert_tablet` batches round-robin over their devices. Timestamps are sequential per device from a fixed base, so runs are deterministic.
+`examples/benchmark.rs` is a write-performance benchmark modeled on the Node.js client's `benchmark/` suite and on [thulab/iot-benchmark](https://github.com/thulab/iot-benchmark). Tablets are pre-generated outside the timed section; N worker threads each own a pooled session and insert `insert_tablet` batches round-robin over their devices. Timestamps are sequential per device from a fixed base, so runs are deterministic.
+
+> **Statistics semantics now mirror iot-benchmark:** the per-operation timed span includes batch preparation (not just the insert RPC), failed operations are excluded from latency samples (counted as `failOperation`/`failPoint`), and the output includes iot-benchmark-style Result Matrix and Latency (ms) Matrix sections (AVG…P999/MAX/SLOWEST_THREAD; percentiles are exact, whereas iot-benchmark uses a t-digest approximation). Numbers produced by earlier versions of this benchmark (RPC-only timing, including the table below) are **not directly comparable** to the new output.
 
 ```sh
 # tree model, defaults: 100 devices × 10 sensors × 20 batches × 1000 rows = 20M points, 8 clients
@@ -264,9 +266,9 @@ cargo run --release --example benchmark -- --mode table \
     --devices 20 --sensors 10 --batches 100 --batch-size 100 --clients 8 --cleanup
 ```
 
-Knobs: `--mode tree|table`, `--devices`, `--sensors`, `--batches` (per device), `--batch-size` (rows per tablet), `--clients` (worker threads = pool size), `--host/--port/--user/--password` (also via `IOTDB_HOST/PORT/USER/PASSWORD`), `--base-ts`, `--point-step`, `--reuse-tablets` (pre-generate only N tablets per worker and re-send them with rebased timestamps — bounds memory for very large runs; the per-batch timestamp rewrite happens inside the timed loop, like a real streaming producer), `--tablets-per-rpc` (tree model: batch N tablets into one `insert_tablets` RPC), `--cleanup`. Sensor types follow the Node.js default distribution (30% FLOAT, 20% DOUBLE, 20% INT32, 10% INT64, 10% TEXT, 10% BOOLEAN). The report includes total points, wall time, points/sec, per-batch latency p50/p90/p95/p99/max, error count, and a read-back row-count verification.
+Knobs: `--mode tree|table`, `--devices`, `--sensors`, `--batches` (per device), `--batch-size` (rows per tablet), `--clients` (worker threads = pool size), `--host/--port/--user/--password` (also via `IOTDB_HOST/PORT/USER/PASSWORD`), `--base-ts`, `--point-step`, `--reuse-tablets` (pre-generate only N tablets per worker and re-send them with rebased timestamps — bounds memory for very large runs; the per-batch timestamp rewrite happens inside the timed loop, like a real streaming producer), `--tablets-per-rpc` (tree model: batch N tablets into one `insert_tablets` RPC), `--cleanup`. Sensor types follow the Node.js default distribution (30% FLOAT, 20% DOUBLE, 20% INT32, 10% INT64, 10% TEXT, 10% BOOLEAN). The report includes the human-readable summary, the iot-benchmark-style Result/Latency matrices, and a read-back row-count verification.
 
-Measured on an Apple M2 Pro (10 cores), IoTDB 2.0.6 standalone in Docker on the same machine (Docker VM: all 10 CPUs / 8 GB; JVM heap 1 GB), release build:
+Measured on an Apple M2 Pro (10 cores), IoTDB 2.0.6 standalone in Docker on the same machine (Docker VM: all 10 CPUs / 8 GB; JVM heap 1 GB), release build, **with the old RPC-only timing** (see note above — expect somewhat lower throughput/higher latency with the current semantics):
 
 | Mode | Devices × Sensors × Batches × Rows | Clients | Points | Throughput | p50 / p99 latency |
 | --- | --- | --- | --- | --- | --- |

@@ -253,7 +253,9 @@ cargo test             # 此时包含在线测试
 
 ## 性能基准测试
 
-`examples/benchmark.rs` 是写入性能基准，参考 Node.js 客户端的 `benchmark/` 套件（后者遵循 [thulab/iot-benchmark](https://github.com/thulab/iot-benchmark)）；指标定义一致，因此各语言 SDK 的结果可直接对比。Tablet 在计时区间之外预先生成；N 个工作线程各持有一个池化会话，按批次轮询各自的设备执行 `insert_tablet`。时间戳从固定基准按设备顺序递增，运行结果可复现。
+`examples/benchmark.rs` 是写入性能基准，参考 Node.js 客户端的 `benchmark/` 套件与 [thulab/iot-benchmark](https://github.com/thulab/iot-benchmark)。Tablet 在计时区间之外预先生成；N 个工作线程各持有一个池化会话，按批次轮询各自的设备执行 `insert_tablet`。时间戳从固定基准按设备顺序递增，运行结果可复现。
+
+> **统计口径现已对齐 iot-benchmark：**单次操作的计时区间包含批次准备（而非仅 insert RPC）；失败操作不计入延迟样本（单独统计 `failOperation`/`failPoint`）；输出包含 iot-benchmark 风格的 Result Matrix 与 Latency (ms) Matrix（AVG…P999/MAX/SLOWEST_THREAD；百分位为精确值，iot-benchmark 使用 t-digest 近似）。旧版基准（仅计 RPC 时间，含下表数据）的数字与新输出**不可直接对比**。
 
 ```sh
 # 树模型，默认规模：100 设备 × 10 传感器 × 20 批 × 1000 行 = 2000 万点，8 客户端
@@ -264,9 +266,9 @@ cargo run --release --example benchmark -- --mode table \
     --devices 20 --sensors 10 --batches 100 --batch-size 100 --clients 8 --cleanup
 ```
 
-参数：`--mode tree|table`、`--devices`、`--sensors`、`--batches`（每设备批数）、`--batch-size`（每 tablet 行数）、`--clients`（工作线程数 = 池大小）、`--host/--port/--user/--password`（亦支持 `IOTDB_HOST/PORT/USER/PASSWORD` 环境变量）、`--base-ts`、`--point-step`、`--reuse-tablets`（每工作线程仅预生成 N 个 tablet 并循环重发，每批重写时间戳基准——为超大规模运行限定内存占用；时间戳重写在计时循环内进行，等同真实流式生产者的按批打时间戳）、`--tablets-per-rpc`（树模型：每次 RPC 通过 `insert_tablets` 批量发送 N 个 tablet）、`--cleanup`。传感器类型分布沿用 Node.js 默认比例（30% FLOAT、20% DOUBLE、20% INT32、10% INT64、10% TEXT、10% BOOLEAN）。报告包含总点数、耗时、points/sec、单批延迟 p50/p90/p95/p99/max、错误数，以及读回行数校验。
+参数：`--mode tree|table`、`--devices`、`--sensors`、`--batches`（每设备批数）、`--batch-size`（每 tablet 行数）、`--clients`（工作线程数 = 池大小）、`--host/--port/--user/--password`（亦支持 `IOTDB_HOST/PORT/USER/PASSWORD` 环境变量）、`--base-ts`、`--point-step`、`--reuse-tablets`（每工作线程仅预生成 N 个 tablet 并循环重发，每批重写时间戳基准——为超大规模运行限定内存占用；时间戳重写在计时循环内进行，等同真实流式生产者的按批打时间戳）、`--tablets-per-rpc`（树模型：每次 RPC 通过 `insert_tablets` 批量发送 N 个 tablet）、`--cleanup`。传感器类型分布沿用 Node.js 默认比例（30% FLOAT、20% DOUBLE、20% INT32、10% INT64、10% TEXT、10% BOOLEAN）。报告包含人类可读摘要、iot-benchmark 风格的 Result/Latency 矩阵，以及读回行数校验。
 
-实测环境：Apple M2 Pro（10 核），IoTDB 2.0.6 standalone（Docker，与客户端同机；Docker VM 全部 10 核 / 8 GB，JVM 堆 1 GB），release 构建：
+实测环境：Apple M2 Pro（10 核），IoTDB 2.0.6 standalone（Docker，与客户端同机；Docker VM 全部 10 核 / 8 GB，JVM 堆 1 GB），release 构建，**采用旧的仅计 RPC 口径**（见上方说明——新口径下吞吐会略低、延迟会略高）：
 
 | 模式 | 设备 × 传感器 × 批数 × 行数 | 客户端 | 总点数 | 吞吐量 | p50 / p99 延迟 |
 | --- | --- | --- | --- | --- | --- |
