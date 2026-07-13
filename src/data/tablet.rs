@@ -128,6 +128,14 @@ impl Tablet {
         &self.timestamps
     }
 
+    /// Mutable access to the timestamp column, e.g. to rebase a reused
+    /// tablet onto a fresh time range without regenerating its values.
+    /// Rows are re-sorted on serialization, so callers need not preserve
+    /// ordering.
+    pub fn timestamps_mut(&mut self) -> &mut [i64] {
+        &mut self.timestamps
+    }
+
     /// `Some` iff this is a table-model tablet.
     pub fn column_categories(&self) -> Option<&[ColumnCategory]> {
         self.column_categories.as_deref()

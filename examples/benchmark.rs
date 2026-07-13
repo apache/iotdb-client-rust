@@ -81,6 +81,16 @@ struct BenchConfig {
     /// Time interval between consecutive points per device (ms), Node.js
     /// `POINT_STEP`.
     point_step: i64,
+    /// When > 0, pre-generate only this many tablets per worker and re-send
+    /// them cyclically, rebasing timestamps per batch so every insert still
+    /// lands on a fresh, disjoint time range (values repeat; timestamps
+    /// don't). Bounds pre-generation memory for very large point counts.
+    /// 0 = pre-generate everything (default, original behavior).
+    reuse_tablets: usize,
+    /// Tree model only: batch this many tablets (different devices) into one
+    /// `insert_tablets` RPC. 1 = one `insert_tablet` per RPC (default,
+    /// original behavior). Latency percentiles are then per multi-tablet RPC.
+    tablets_per_rpc: usize,
     cleanup: bool,
 }
 
@@ -108,6 +118,11 @@ OPTIONS:
     --password <PASS>     Password (default: $IOTDB_PASSWORD or root)
     --base-ts <MS>        Base epoch-ms timestamp (default: 1720000000000)
     --point-step <MS>     Interval between points per device (default: 1000)
+    --reuse-tablets <N>   Pre-generate only N tablets per worker and re-send
+                          them with rebased timestamps (bounds memory for
+                          very large runs; 0 = pre-generate all, default)
+    --tablets-per-rpc <N> Tree model only: send N tablets per RPC via
+                          insert_tablets (default: 1 = insert_tablet)
     --cleanup             Drop the benchmark database after the run
     --help                Print this help
 
@@ -132,6 +147,8 @@ fn parse_args() -> BenchConfig {
         password: env_or("IOTDB_PASSWORD", "root"),
         base_ts: 1_720_000_000_000,
         point_step: 1000,
+        reuse_tablets: 0,
+        tablets_per_rpc: 1,
         cleanup: false,
     };
 
@@ -168,6 +185,8 @@ fn parse_args() -> BenchConfig {
             "--password" => config.password = value(&mut i, flag),
             "--base-ts" => config.base_ts = parse_num(&value(&mut i, flag), flag) as i64,
             "--point-step" => config.point_step = parse_num(&value(&mut i, flag), flag) as i64,
+            "--reuse-tablets" => config.reuse_tablets = parse_num(&value(&mut i, flag), flag),
+            "--tablets-per-rpc" => config.tablets_per_rpc = parse_num(&value(&mut i, flag), flag),
             "--cleanup" => config.cleanup = true,
             "--help" | "-h" => {
                 println!("{USAGE}");
@@ -187,11 +206,16 @@ fn parse_args() -> BenchConfig {
         ("--batches", config.batches),
         ("--batch-size", config.batch_size),
         ("--clients", config.clients),
+        ("--tablets-per-rpc", config.tablets_per_rpc),
     ] {
         if v == 0 {
             eprintln!("{name} must be positive");
             exit(2);
         }
+    }
+    if config.tablets_per_rpc > 1 && config.mode == Mode::Table {
+        eprintln!("--tablets-per-rpc requires --mode tree (insert_tablets is tree-model only)");
+        exit(2);
     }
     config
 }
@@ -609,14 +633,26 @@ fn main() -> Result<()> {
     // batch-major, i.e. round-robin over its devices.
     println!("[Setup] pre-generating test data...");
     let t0 = Instant::now();
-    let mut worker_tablets: Vec<Vec<Tablet>> = Vec::with_capacity(config.clients);
+    // Each worker's full schedule is `batches × its devices` inserts. With
+    // --reuse-tablets N only the first N tablets are materialized; the worker
+    // cycles over them and rebases timestamps per iteration (see worker loop).
+    let mut worker_tablets: Vec<(Vec<Tablet>, usize)> = Vec::with_capacity(config.clients);
     for w in 0..config.clients {
         let devices: Vec<usize> = (0..config.devices)
             .filter(|d| d % config.clients == w)
             .collect();
-        let mut tablets = Vec::with_capacity(devices.len() * config.batches);
-        for batch in 0..config.batches {
+        let schedule_len = devices.len() * config.batches;
+        let materialized = if config.reuse_tablets > 0 {
+            schedule_len.min(config.reuse_tablets)
+        } else {
+            schedule_len
+        };
+        let mut tablets = Vec::with_capacity(materialized);
+        'gen: for batch in 0..config.batches {
             for &device in &devices {
+                if tablets.len() == materialized {
+                    break 'gen;
+                }
                 tablets.push(build_tablet(
                     &config,
                     device,
@@ -626,12 +662,20 @@ fn main() -> Result<()> {
                 )?);
             }
         }
-        worker_tablets.push(tablets);
+        worker_tablets.push((tablets, schedule_len));
     }
     println!(
-        "[Setup] {} tablets generated in {:.2}s",
-        worker_tablets.iter().map(Vec::len).sum::<usize>(),
-        t0.elapsed().as_secs_f64()
+        "[Setup] {} tablets generated in {:.2}s{}",
+        worker_tablets.iter().map(|(t, _)| t.len()).sum::<usize>(),
+        t0.elapsed().as_secs_f64(),
+        if config.reuse_tablets > 0 {
+            format!(
+                " (reused cyclically over {} inserts)",
+                worker_tablets.iter().map(|(_, n)| n).sum::<usize>()
+            )
+        } else {
+            String::new()
+        }
     );
 
     // --- Timed insert phase ------------------------------------------------
@@ -665,21 +709,53 @@ fn main() -> Result<()> {
         });
 
         let handles: Vec<_> = worker_tablets
-            .iter()
-            .map(|tablets| {
+            .iter_mut()
+            .map(|(tablets, schedule_len)| {
+                let schedule_len = *schedule_len;
                 let pool = &pool;
                 let ops_done = &ops_done;
                 let points_done = &points_done;
                 scope.spawn(move || -> Result<WorkerStats> {
                     let mut session = pool.acquire()?;
                     let mut stats = WorkerStats {
-                        latencies_ms: Vec::with_capacity(tablets.len()),
+                        latencies_ms: Vec::with_capacity(schedule_len),
                         ..WorkerStats::default()
                     };
-                    for tablet in tablets {
-                        let points = (tablet.row_count() * config.sensors) as u64;
+                    let materialized = tablets.len();
+                    let mut i = 0;
+                    while i < schedule_len {
+                        // A chunk never wraps the materialized ring, so it
+                        // always maps to one contiguous slice.
+                        let idx = i % materialized;
+                        let chunk = config
+                            .tablets_per_rpc
+                            .min(schedule_len - i)
+                            .min(materialized - idx);
+                        if config.reuse_tablets > 0 {
+                            // Rebase each reused tablet onto its iteration's
+                            // disjoint time window so every insert writes
+                            // fresh timestamps. This runs inside the timed
+                            // loop on purpose: it's the same per-batch
+                            // timestamping a real streaming producer would do.
+                            for (k, tablet) in tablets[idx..idx + chunk].iter_mut().enumerate() {
+                                let window = config.base_ts
+                                    + ((i + k) * config.batch_size) as i64 * config.point_step;
+                                for (r, ts) in tablet.timestamps_mut().iter_mut().enumerate() {
+                                    *ts = window + r as i64 * config.point_step;
+                                }
+                            }
+                        }
+                        let batch = &tablets[idx..idx + chunk];
+                        let points: u64 = batch
+                            .iter()
+                            .map(|t| (t.row_count() * config.sensors) as u64)
+                            .sum();
                         let start = Instant::now();
-                        let outcome = session.insert_tablet(tablet);
+                        let outcome = if chunk == 1 {
+                            session.insert_tablet(&batch[0])
+                        } else {
+                            session.insert_tablets(batch, false)
+                        };
                         stats
                             .latencies_ms
                             .push(start.elapsed().as_secs_f64() * 1000.0);
@@ -697,6 +773,7 @@ fn main() -> Result<()> {
                                 }
                             }
                         }
+                        i += chunk;
                     }
                     Ok(stats)
                 })

@@ -264,17 +264,19 @@ cargo run --release --example benchmark -- --mode table \
     --devices 20 --sensors 10 --batches 100 --batch-size 100 --clients 8 --cleanup
 ```
 
-Knobs: `--mode tree|table`, `--devices`, `--sensors`, `--batches` (per device), `--batch-size` (rows per tablet), `--clients` (worker threads = pool size), `--host/--port/--user/--password` (also via `IOTDB_HOST/PORT/USER/PASSWORD`), `--base-ts`, `--point-step`, `--cleanup`. Sensor types follow the Node.js default distribution (30% FLOAT, 20% DOUBLE, 20% INT32, 10% INT64, 10% TEXT, 10% BOOLEAN). The report includes total points, wall time, points/sec, per-batch latency p50/p90/p95/p99/max, error count, and a read-back row-count verification.
+Knobs: `--mode tree|table`, `--devices`, `--sensors`, `--batches` (per device), `--batch-size` (rows per tablet), `--clients` (worker threads = pool size), `--host/--port/--user/--password` (also via `IOTDB_HOST/PORT/USER/PASSWORD`), `--base-ts`, `--point-step`, `--reuse-tablets` (pre-generate only N tablets per worker and re-send them with rebased timestamps — bounds memory for very large runs; the per-batch timestamp rewrite happens inside the timed loop, like a real streaming producer), `--tablets-per-rpc` (tree model: batch N tablets into one `insert_tablets` RPC), `--cleanup`. Sensor types follow the Node.js default distribution (30% FLOAT, 20% DOUBLE, 20% INT32, 10% INT64, 10% TEXT, 10% BOOLEAN). The report includes total points, wall time, points/sec, per-batch latency p50/p90/p95/p99/max, error count, and a read-back row-count verification.
 
-Measured on an Apple M2 Pro (10 cores), IoTDB 2.0.6 standalone in Docker on the same machine, release build, 8 clients:
+Measured on an Apple M2 Pro (10 cores), IoTDB 2.0.6 standalone in Docker on the same machine (Docker VM: all 10 CPUs / 8 GB; JVM heap 1 GB), release build:
 
-| Mode | Devices × Sensors × Batches × Rows | Points | Throughput | p50 / p99 latency |
-| --- | --- | --- | --- | --- |
-| tree | 20 × 10 × 100 × 100 | 2M | ~1.98M pts/s | 2.46 ms / 8.38 ms |
-| table | 20 × 10 × 100 × 100 | 2M | ~1.97M pts/s | 2.13 ms / 9.97 ms |
-| tree | 100 × 10 × 10 × 1000 | 10M | ~9.73M pts/s | 4.36 ms / 72.18 ms |
+| Mode | Devices × Sensors × Batches × Rows | Clients | Points | Throughput | p50 / p99 latency |
+| --- | --- | --- | --- | --- | --- |
+| tree | 20 × 10 × 100 × 100 | 8 | 2M | ~1.98M pts/s | 2.46 ms / 8.38 ms |
+| table | 20 × 10 × 100 × 100 | 8 | 2M | ~1.97M pts/s | 2.13 ms / 9.97 ms |
+| tree | 100 × 10 × 20 × 1000 | 8 | 20M | ~12.4M pts/s | 4.45 ms / 27.03 ms |
+| tree | 100 × 100 × 4 × 1000 | 10 | 40M | ~15–20M pts/s | 31 ms / 156 ms |
+| tree | 100 × 100 × 25 × 1000, `--tablets-per-rpc 4` | 10 | 250M | **~21–22.5M pts/s** | 105 ms / 907 ms |
 
-Throughput scales with tablet size (rows × sensors per RPC); 1000-row tablets give ~5× the throughput of 100-row tablets at the same client count. Numbers are client+server on one machine — treat them as an upper bound on client overhead, not a server capacity measurement.
+Throughput scales with points per RPC: wider tablets (100 sensors = 100k points per 1000-row tablet) and multi-tablet `insert_tablets` batching lift the same hardware from ~12M to ~22M pts/s sustained (250M points, `--reuse-tablets`). Beyond ~400k points per RPC — or more clients than cores — throughput plateaus and tail latency grows; during peak runs the server JVM bursts to ~3 cores then stalls on memtable flushes while the Rust client sits at ~30% of one core, so the ceiling here is the co-located dockerized server (1 GB heap), not the client. Numbers are client+server on one machine — treat them as an upper bound on client overhead, not a server capacity measurement.
 
 ## Project layout
 

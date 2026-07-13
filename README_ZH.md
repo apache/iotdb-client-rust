@@ -264,17 +264,19 @@ cargo run --release --example benchmark -- --mode table \
     --devices 20 --sensors 10 --batches 100 --batch-size 100 --clients 8 --cleanup
 ```
 
-参数：`--mode tree|table`、`--devices`、`--sensors`、`--batches`（每设备批数）、`--batch-size`（每 tablet 行数）、`--clients`（工作线程数 = 池大小）、`--host/--port/--user/--password`（亦支持 `IOTDB_HOST/PORT/USER/PASSWORD` 环境变量）、`--base-ts`、`--point-step`、`--cleanup`。传感器类型分布沿用 Node.js 默认比例（30% FLOAT、20% DOUBLE、20% INT32、10% INT64、10% TEXT、10% BOOLEAN）。报告包含总点数、耗时、points/sec、单批延迟 p50/p90/p95/p99/max、错误数，以及读回行数校验。
+参数：`--mode tree|table`、`--devices`、`--sensors`、`--batches`（每设备批数）、`--batch-size`（每 tablet 行数）、`--clients`（工作线程数 = 池大小）、`--host/--port/--user/--password`（亦支持 `IOTDB_HOST/PORT/USER/PASSWORD` 环境变量）、`--base-ts`、`--point-step`、`--reuse-tablets`（每工作线程仅预生成 N 个 tablet 并循环重发，每批重写时间戳基准——为超大规模运行限定内存占用；时间戳重写在计时循环内进行，等同真实流式生产者的按批打时间戳）、`--tablets-per-rpc`（树模型：每次 RPC 通过 `insert_tablets` 批量发送 N 个 tablet）、`--cleanup`。传感器类型分布沿用 Node.js 默认比例（30% FLOAT、20% DOUBLE、20% INT32、10% INT64、10% TEXT、10% BOOLEAN）。报告包含总点数、耗时、points/sec、单批延迟 p50/p90/p95/p99/max、错误数，以及读回行数校验。
 
-实测环境：Apple M2 Pro（10 核），IoTDB 2.0.6 standalone（Docker，与客户端同机），release 构建，8 客户端：
+实测环境：Apple M2 Pro（10 核），IoTDB 2.0.6 standalone（Docker，与客户端同机；Docker VM 全部 10 核 / 8 GB，JVM 堆 1 GB），release 构建：
 
-| 模式 | 设备 × 传感器 × 批数 × 行数 | 总点数 | 吞吐量 | p50 / p99 延迟 |
-| --- | --- | --- | --- | --- |
-| tree | 20 × 10 × 100 × 100 | 200 万 | ~198 万 pts/s | 2.46 ms / 8.38 ms |
-| table | 20 × 10 × 100 × 100 | 200 万 | ~197 万 pts/s | 2.13 ms / 9.97 ms |
-| tree | 100 × 10 × 10 × 1000 | 1000 万 | ~973 万 pts/s | 4.36 ms / 72.18 ms |
+| 模式 | 设备 × 传感器 × 批数 × 行数 | 客户端 | 总点数 | 吞吐量 | p50 / p99 延迟 |
+| --- | --- | --- | --- | --- | --- |
+| tree | 20 × 10 × 100 × 100 | 8 | 200 万 | ~198 万 pts/s | 2.46 ms / 8.38 ms |
+| table | 20 × 10 × 100 × 100 | 8 | 200 万 | ~197 万 pts/s | 2.13 ms / 9.97 ms |
+| tree | 100 × 10 × 20 × 1000 | 8 | 2000 万 | ~1240 万 pts/s | 4.45 ms / 27.03 ms |
+| tree | 100 × 100 × 4 × 1000 | 10 | 4000 万 | ~1500–2000 万 pts/s | 31 ms / 156 ms |
+| tree | 100 × 100 × 25 × 1000，`--tablets-per-rpc 4` | 10 | 2.5 亿 | **~2100–2250 万 pts/s** | 105 ms / 907 ms |
 
-吞吐量随 tablet 大小（每 RPC 的行 × 传感器数）增长；同等客户端数下 1000 行 tablet 的吞吐约为 100 行的 5 倍。数据为客户端与服务器同机测得——应视为客户端开销的上界，而非服务器容量。
+吞吐量随每 RPC 点数增长：更宽的 tablet（100 传感器 × 1000 行 = 每 tablet 10 万点）加上 `insert_tablets` 多 tablet 批量，可将同一硬件从 ~1200 万提升到 ~2200 万 pts/s 持续吞吐（2.5 亿点，`--reuse-tablets`）。每 RPC 超过约 40 万点、或客户端数超过核数后，吞吐进入平台期且尾延迟上升；峰值运行期间服务器 JVM 写入突发时占 ~3 核、随后阻塞在 memtable 刷盘上，而 Rust 客户端仅占单核 ~30%——瓶颈在同机 Docker 内的服务器（1 GB 堆），不在客户端。数据为客户端与服务器同机测得——应视为客户端开销的上界，而非服务器容量。
 
 ## 项目结构
 
