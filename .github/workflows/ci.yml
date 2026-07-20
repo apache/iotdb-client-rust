@@ -86,18 +86,19 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # A bare TCP probe is unreliable: docker's port proxy accepts connections
-      # before the DataNode listens (then resets them), so wait for the
-      # startup banner in the container log instead.
+      # before the DataNode listens (then resets them). Match the DataNode
+      # banner specifically — the ConfigNode prints a similar "set up
+      # successfully" line earlier in the standalone image.
       - name: Wait for IoTDB
         run: |
           for i in $(seq 1 120); do
-            if docker logs "${{ job.services.iotdb.id }}" 2>&1 | grep -q "set up successfully"; then
-              echo "IoTDB is up after ${i}s"
+            if docker logs "${{ job.services.iotdb.id }}" 2>&1 | grep -q "DataNode is set up successfully"; then
+              echo "IoTDB DataNode is up after ${i}s"
               exit 0
             fi
             sleep 1
           done
-          echo "IoTDB did not become ready in 120s" >&2
+          echo "IoTDB DataNode did not become ready in 120s" >&2
           docker logs "${{ job.services.iotdb.id }}" 2>&1 | tail -50
           exit 1
 
