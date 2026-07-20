@@ -24,7 +24,7 @@
 
 ```toml
 [dependencies]
-iotdb-client = "0.1"
+iotdb-client-rust = "0.1"
 ```
 
 在此之前，可使用 git 依赖：
@@ -186,7 +186,7 @@ let config = SessionConfig { enable_rpc_compression: true, ..Default::default() 
 **TLS** 位于 `tls` cargo feature 之后（基于 [`native-tls`](https://crates.io/crates/native-tls) 的平台原生 TLS）：
 
 ```toml
-iotdb-client = { version = "0.1", features = ["tls"] }
+iotdb-client-rust = { version = "0.1", features = ["tls"] }
 ```
 
 ```rust

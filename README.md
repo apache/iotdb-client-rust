@@ -24,7 +24,7 @@ Once published to crates.io:
 
 ```toml
 [dependencies]
-iotdb-client = "0.1"
+iotdb-client-rust = "0.1"
 ```
 
 Until then, use a git dependency:
@@ -186,7 +186,7 @@ It must match the **server** setting `dn_rpc_thrift_compression_enable` (default
 **TLS** is behind the `tls` cargo feature (platform-native TLS via [`native-tls`](https://crates.io/crates/native-tls)):
 
 ```toml
-iotdb-client = { version = "0.1", features = ["tls"] }
+iotdb-client-rust = { version = "0.1", features = ["tls"] }
 ```
 
 ```rust

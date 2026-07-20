@@ -16,7 +16,7 @@
 # under the License.
 
 [package]
-name = "iotdb-client"
+name = "iotdb-client-rust"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
@@ -25,6 +25,11 @@ license = "Apache-2.0"
 repository = "https://github.com/apache/iotdb-client-rust"
 keywords = ["iotdb", "timeseries", "database", "client"]
 categories = ["database"]
+
+# Import name stays `iotdb_client` (the package name carries the -rust suffix
+# only because `iotdb-client` is taken on crates.io).
+[lib]
+name = "iotdb_client"
 
 [dependencies]
 thrift = "0.23"
