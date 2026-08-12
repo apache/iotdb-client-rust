@@ -183,7 +183,11 @@ let config = SessionConfig { enable_rpc_compression: true, ..Default::default() 
 
 必须与**服务端**配置 `dn_rpc_thrift_compression_enable`（默认 `false`）一致。服务端只讲一种协议——没有按连接协商的机制，任意方向的不匹配都会在第一个 RPC 上以传输错误失败。
 
-**TLS** 位于 `tls` cargo feature 之后（基于 [`native-tls`](https://crates.io/crates/native-tls) 的平台原生 TLS）：
+**TLS** 位于 `tls` cargo feature 之后。其底层使用
+[`rustls`](https://crates.io/crates/rustls) 和 `ring` 密码学 provider，支持
+TLS 1.2/1.3。所有平台均使用 rustls/WebPKI 执行一致的服务端证书校验；系统信任根通过
+[`rustls-native-certs`](https://crates.io/crates/rustls-native-certs) 加载，
+`ca_cert_path` 指定的 CA 会追加到这些信任根中。
 
 ```toml
 iotdb-client-rust = { version = "0.1", features = ["tls"] }
@@ -199,6 +203,9 @@ let config = SessionConfig {
 };
 // 或：TableSession::builder().use_ssl(true).ca_cert_path("ca.pem")...
 ```
+
+`accept_invalid_certs` 会关闭证书链和主机名校验，但 TLS 握手签名仍会经过密码学校验。
+该选项只应对受控的测试服务使用。
 
 **双向 TLS**（服务端 `thrift_ssl_client_auth=true`）需额外提供 PEM 客户端证书及其 PKCS#8 私钥 —— 对应 Node.js 的 `sslOptions.cert`/`sslOptions.key`：
 
