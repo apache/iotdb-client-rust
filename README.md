@@ -183,7 +183,12 @@ let config = SessionConfig { enable_rpc_compression: true, ..Default::default() 
 
 It must match the **server** setting `dn_rpc_thrift_compression_enable` (default `false`). The server speaks exactly one protocol — there is no per-connection negotiation, so a mismatch in either direction fails at the first RPC with a transport error.
 
-**TLS** is behind the `tls` cargo feature (platform-native TLS via [`native-tls`](https://crates.io/crates/native-tls)):
+**TLS** is behind the `tls` cargo feature. It uses [`rustls`](https://crates.io/crates/rustls)
+with the `ring` crypto provider and supports TLS 1.2/1.3. Server certificates are
+verified with [`rustls-platform-verifier`](https://crates.io/crates/rustls-platform-verifier),
+so the platform trust store and verification policy are used where available;
+on Linux/BSD, platform roots are loaded and verified with WebPKI. A CA supplied
+through `ca_cert_path` is added to those platform roots.
 
 ```toml
 iotdb-client-rust = { version = "0.1", features = ["tls"] }
@@ -199,6 +204,10 @@ let config = SessionConfig {
 };
 // or: TableSession::builder().use_ssl(true).ca_cert_path("ca.pem")...
 ```
+
+`accept_invalid_certs` disables certificate-chain and hostname verification,
+but TLS handshake signatures are still cryptographically verified. It should
+only be used with controlled test servers.
 
 For **mutual TLS** (server has `thrift_ssl_client_auth=true`), add a PEM client certificate and its PKCS#8 key — the analogue of the Node.js `sslOptions.cert`/`sslOptions.key`:
 

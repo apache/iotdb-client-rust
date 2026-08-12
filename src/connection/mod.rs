@@ -24,7 +24,18 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(feature = "tls")]
+use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(feature = "tls")]
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+#[cfg(feature = "tls")]
+use rustls::crypto::WebPkiSupportedAlgorithms;
+#[cfg(feature = "tls")]
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(feature = "tls")]
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
 
 use thrift::protocol::{
     TBinaryInputProtocol, TBinaryOutputProtocol, TCompactInputProtocol, TCompactOutputProtocol,
@@ -63,9 +74,10 @@ pub enum RpcProtocol {
 #[derive(Debug, Clone, Default)]
 pub struct TlsOptions {
     /// PEM certificate added as a trusted root (e.g. a private CA or the
-    /// server's self-signed certificate).
+    /// server's self-signed certificate), in addition to the platform roots.
     pub ca_cert_path: Option<std::path::PathBuf>,
-    /// Skip certificate verification entirely (self-signed test certs).
+    /// Skip certificate-chain and hostname verification (self-signed test
+    /// certs). TLS handshake signatures are still verified.
     /// **Dangerous** outside tests. Default `false`.
     pub accept_invalid_certs: bool,
     /// Hostname used for SNI + certificate validation instead of the
@@ -264,56 +276,155 @@ fn connect_stream(endpoint: &Endpoint, connect_timeout: Duration) -> Result<TcpS
 #[cfg(feature = "tls")]
 fn tls_handshake(
     endpoint: &Endpoint,
-    stream: TcpStream,
+    mut stream: TcpStream,
     tls: &TlsOptions,
-) -> Result<native_tls::TlsStream<TcpStream>> {
-    let mut builder = native_tls::TlsConnector::builder();
-    if let Some(path) = &tls.ca_cert_path {
-        let pem = std::fs::read(path).map_err(|e| {
-            Error::Client(format!(
-                "cannot read CA certificate {}: {e}",
-                path.display()
-            ))
-        })?;
-        let cert = native_tls::Certificate::from_pem(&pem).map_err(Error::Tls)?;
-        builder.add_root_certificate(cert);
+) -> Result<StreamOwned<ClientConnection, TcpStream>> {
+    let config = tls_client_config(tls)?;
+    let domain = tls.domain_override.as_deref().unwrap_or(&endpoint.host);
+    let server_name = ServerName::try_from(domain.to_owned())
+        .map_err(|e| Error::Client(format!("invalid TLS server name '{domain}': {e}")))?;
+    let mut connection =
+        ClientConnection::new(config, server_name).map_err(|e| Error::Tls(e.to_string()))?;
+
+    connection
+        .complete_io(&mut stream)
+        .map_err(|e| Error::Tls(e.to_string()))?;
+    if connection.is_handshaking() {
+        return Err(Error::Tls("TLS handshake did not complete".into()));
     }
-    if tls.accept_invalid_certs {
-        builder.danger_accept_invalid_certs(true);
-    }
-    match (&tls.client_cert_path, &tls.client_key_path) {
+
+    Ok(StreamOwned::new(connection, stream))
+}
+
+#[cfg(feature = "tls")]
+fn tls_client_config(tls: &TlsOptions) -> Result<Arc<ClientConfig>> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let extra_roots = match &tls.ca_cert_path {
+        Some(path) => load_certificates(path, "CA certificate")?,
+        None => Vec::new(),
+    };
+
+    let verifier: Arc<dyn ServerCertVerifier> = if tls.accept_invalid_certs {
+        Arc::new(NoCertificateVerification::new(
+            provider.signature_verification_algorithms,
+        ))
+    } else {
+        Arc::new(
+            rustls_platform_verifier::Verifier::new_with_extra_roots(
+                extra_roots,
+                Arc::clone(&provider),
+            )
+            .map_err(|e| Error::Tls(e.to_string()))?,
+        )
+    };
+
+    let builder = ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| Error::Tls(e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier);
+
+    let config = match (&tls.client_cert_path, &tls.client_key_path) {
         (Some(cert_path), Some(key_path)) => {
-            let cert = std::fs::read(cert_path).map_err(|e| {
-                Error::Client(format!(
-                    "cannot read client certificate {}: {e}",
-                    cert_path.display()
-                ))
-            })?;
-            let key = std::fs::read(key_path).map_err(|e| {
+            let certificates = load_certificates(cert_path, "client certificate")?;
+            let key_file = std::fs::File::open(key_path).map_err(|e| {
                 Error::Client(format!(
                     "cannot read client key {}: {e}",
                     key_path.display()
                 ))
             })?;
-            let identity = native_tls::Identity::from_pkcs8(&cert, &key).map_err(Error::Tls)?;
-            builder.identity(identity);
+            let mut key_reader = std::io::BufReader::new(key_file);
+            let key = rustls_pemfile::pkcs8_private_keys(&mut key_reader)
+                .next()
+                .transpose()
+                .map_err(|e| Error::Tls(format!("cannot parse client key: {e}")))?
+                .ok_or_else(|| Error::Tls("client key is not a PEM PKCS#8 private key".into()))?;
+            builder
+                .with_client_auth_cert(certificates, key.into())
+                .map_err(|e| Error::Tls(e.to_string()))?
         }
-        (None, None) => {}
+        (None, None) => builder.with_no_client_auth(),
         _ => {
             return Err(Error::Client(
                 "mutual TLS requires both client_cert_path and client_key_path".into(),
             ))
         }
+    };
+
+    Ok(Arc::new(config))
+}
+
+#[cfg(feature = "tls")]
+fn load_certificates(
+    path: &std::path::Path,
+    description: &str,
+) -> Result<Vec<CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::Client(format!("cannot read {description} {}: {e}", path.display())))?;
+    let mut reader = std::io::BufReader::new(file);
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| Error::Tls(format!("cannot parse {description}: {e}")))?;
+    if certificates.is_empty() {
+        return Err(Error::Tls(format!(
+            "{description} {} contains no PEM certificates",
+            path.display()
+        )));
     }
-    let connector = builder.build().map_err(Error::Tls)?;
-    let domain = tls.domain_override.as_deref().unwrap_or(&endpoint.host);
-    connector.connect(domain, stream).map_err(|e| match e {
-        native_tls::HandshakeError::Failure(e) => Error::Tls(e),
-        // Blocking sockets never yield the mid-handshake variant.
-        native_tls::HandshakeError::WouldBlock(_) => {
-            Error::Client("TLS handshake interrupted".into())
+    Ok(certificates)
+}
+
+/// Disables certificate-chain and hostname validation while retaining
+/// cryptographic verification of the TLS handshake signatures.
+#[cfg(feature = "tls")]
+#[derive(Debug)]
+struct NoCertificateVerification {
+    supported_algorithms: WebPkiSupportedAlgorithms,
+}
+
+#[cfg(feature = "tls")]
+impl NoCertificateVerification {
+    fn new(supported_algorithms: WebPkiSupportedAlgorithms) -> Self {
+        Self {
+            supported_algorithms,
         }
-    })
+    }
+}
+
+#[cfg(feature = "tls")]
+impl ServerCertVerifier for NoCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.supported_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.supported_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported_algorithms.supported_schemes()
+    }
 }
 
 /// A `TlsStream` shared between the read and write transports.
@@ -325,15 +436,15 @@ fn tls_handshake(
 /// read and write never contend.
 #[cfg(feature = "tls")]
 #[derive(Clone)]
-struct SharedTlsStream(std::sync::Arc<std::sync::Mutex<native_tls::TlsStream<TcpStream>>>);
+struct SharedTlsStream(std::sync::Arc<std::sync::Mutex<StreamOwned<ClientConnection, TcpStream>>>);
 
 #[cfg(feature = "tls")]
 impl SharedTlsStream {
-    fn new(stream: native_tls::TlsStream<TcpStream>) -> Self {
+    fn new(stream: StreamOwned<ClientConnection, TcpStream>) -> Self {
         Self(std::sync::Arc::new(std::sync::Mutex::new(stream)))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, native_tls::TlsStream<TcpStream>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, StreamOwned<ClientConnection, TcpStream>> {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
@@ -515,6 +626,7 @@ mod tls_tests {
     use super::*;
     use crate::protocol::client::TIClientRPCServiceSyncClient;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn fixture(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -522,14 +634,56 @@ mod tls_tests {
             .join(name)
     }
 
-    /// Spawn a TLS acceptor on a loopback port that completes one handshake
-    /// and then drops the connection. Uses the checked-in self-signed cert
-    /// (CN=localhost, SAN DNS:localhost + IP:127.0.0.1, 100-year validity).
+    fn pkcs8_key(name: &str) -> rustls::pki_types::PrivateKeyDer<'static> {
+        let file = std::fs::File::open(fixture(name)).expect("read key fixture");
+        let mut reader = std::io::BufReader::new(file);
+        let key = rustls_pemfile::pkcs8_private_keys(&mut reader)
+            .next()
+            .expect("PKCS#8 key item")
+            .expect("parse PKCS#8 key")
+            .into();
+        key
+    }
+
+    fn server_config(require_client_auth: bool) -> Arc<rustls::ServerConfig> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions");
+        let builder = if require_client_auth {
+            let mut roots = rustls::RootCertStore::empty();
+            for certificate in
+                load_certificates(&fixture("client-cert.pem"), "client root").expect("client root")
+            {
+                roots.add(certificate).expect("add client root");
+            }
+            let verifier =
+                rustls::server::WebPkiClientVerifier::builder_with_provider(roots.into(), provider)
+                    .build()
+                    .expect("client verifier");
+            builder.with_client_cert_verifier(verifier)
+        } else {
+            builder.with_no_client_auth()
+        };
+        let config = builder
+            .with_single_cert(
+                load_certificates(&fixture("cert.pem"), "server certificate")
+                    .expect("server certificate"),
+                pkcs8_key("key.pem"),
+            )
+            .expect("server config");
+        Arc::new(config)
+    }
+
+    /// Spawn a rustls acceptor on a loopback port that completes handshakes
+    /// and then drops each connection. Uses the checked-in self-signed cert
+    /// (CN=localhost, SAN DNS:localhost + IP:127.0.0.1).
     fn tls_acceptor_once() -> Endpoint {
-        let cert = std::fs::read(fixture("cert.pem")).expect("read cert fixture");
-        let key = std::fs::read(fixture("key.pem")).expect("read key fixture");
-        let identity = native_tls::Identity::from_pkcs8(&cert, &key).expect("identity");
-        let acceptor = native_tls::TlsAcceptor::new(identity).expect("acceptor");
+        tls_acceptor(false)
+    }
+
+    fn tls_acceptor(require_client_auth: bool) -> Endpoint {
+        let config = server_config(require_client_auth);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("local_addr").port();
         std::thread::spawn(move || {
@@ -537,7 +691,11 @@ mod tls_tests {
                 match stream {
                     // Handshake (which may itself fail when the client
                     // rejects our cert — fine, just move on), then drop.
-                    Ok(s) => drop(acceptor.accept(s)),
+                    Ok(mut stream) => {
+                        let mut connection = rustls::ServerConnection::new(Arc::clone(&config))
+                            .expect("server connection");
+                        let _ = connection.complete_io(&mut stream);
+                    }
                     Err(_) => break,
                 }
             }
@@ -674,15 +832,12 @@ mod tls_tests {
         assert!(matches!(err, Error::Tls(_)), "got {err:?}");
     }
 
-    /// Mutual TLS: a PEM client certificate + PKCS#8 key load into an
-    /// identity and the handshake completes with the identity configured.
-    /// `native-tls`'s `TlsAcceptor` has no API to *request* a client
-    /// certificate, so the loopback server cannot verify it — acceptor-side
-    /// client-auth is exercised only by the live `IOTDB_TLS_URL` test
-    /// against a real server.
+    /// Mutual TLS: a PEM client certificate + PKCS#8 key load into the
+    /// client config, and a rustls server that requires the fixture client
+    /// certificate completes the handshake.
     #[test]
     fn tls_client_identity_handshake_succeeds() {
-        let endpoint = tls_acceptor_once();
+        let endpoint = tls_acceptor(true);
         let options = ConnectionOptions {
             connect_timeout: Duration::from_millis(500),
             protocol: RpcProtocol::Binary,

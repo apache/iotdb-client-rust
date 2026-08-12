@@ -25,11 +25,12 @@ Not secrets — the keys never protect anything.
 
 | File | Role |
 |---|---|
-| `cert.pem` + `key.pem` | server identity (loopback `TlsAcceptor`, live-server keystore) |
+| `cert.pem` + `key.pem` | server identity (loopback rustls server, live-server keystore) |
 | `client-cert.pem` + `client-key.pem` | client identity for the mutual-TLS tests |
 
-macOS SecureTransport imposes extra requirements even on explicitly
-trusted roots: validity ≤ 825 days (error −67901) and an
+The macOS verifier used by `rustls-platform-verifier` imposes extra
+requirements even on explicitly trusted roots: validity ≤ 825 days
+(error −67901) and an
 `extendedKeyUsage=serverAuth` extension (error −67609). Current cert
 expires **2028-10-10**; when the trusted-root test starts failing with a
 validity/expiry error, regenerate:
@@ -43,10 +44,9 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
   -addext "keyUsage=digitalSignature,keyEncipherment"
 ```
 
-The client certificate (expires **2028-10-10** as well) is standalone
-self-signed — `cert.pem` cannot act as its issuer because its `keyUsage`
-lacks `keyCertSign`; nothing in the tests validates the client chain
-anyway (`native-tls`'s `TlsAcceptor` cannot request client certs):
+The client certificate (expires **2028-10-10** as well) is a standalone
+self-signed test CA and client identity. The rustls loopback server trusts it
+as a root and requires it during the mutual-TLS test:
 
 ```sh
 cd tests/fixtures/tls
