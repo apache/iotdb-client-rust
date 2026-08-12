@@ -655,12 +655,11 @@ mod tls_tests {
     fn pkcs8_key(name: &str) -> rustls::pki_types::PrivateKeyDer<'static> {
         let file = std::fs::File::open(fixture(name)).expect("read key fixture");
         let mut reader = std::io::BufReader::new(file);
-        let key = rustls_pemfile::pkcs8_private_keys(&mut reader)
-            .next()
+        let mut keys = rustls_pemfile::pkcs8_private_keys(&mut reader);
+        keys.next()
             .expect("PKCS#8 key item")
             .expect("parse PKCS#8 key")
-            .into();
-        key
+            .into()
     }
 
     fn server_config(require_client_auth: bool) -> Arc<rustls::ServerConfig> {
@@ -697,28 +696,35 @@ mod tls_tests {
     /// and then drops each connection. Uses the checked-in self-signed cert
     /// (CN=localhost, SAN DNS:localhost + IP:127.0.0.1).
     fn tls_acceptor_once() -> Endpoint {
-        tls_acceptor(false)
+        tls_acceptor(false).0
     }
 
-    fn tls_acceptor(require_client_auth: bool) -> Endpoint {
+    fn tls_acceptor(
+        require_client_auth: bool,
+    ) -> (
+        Endpoint,
+        std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+    ) {
         let config = server_config(require_client_auth);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("local_addr").port();
+        let (handshake_result_tx, handshake_result_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    // Handshake (which may itself fail when the client
-                    // rejects our cert — fine, just move on), then drop.
-                    Ok(mut stream) => {
-                        let mut connection = rustls::ServerConnection::new(Arc::clone(&config))
-                            .expect("server connection");
-                        let _ = connection.complete_io(&mut stream);
-                    }
-                    Err(_) => break,
-                }
-            }
+            let result = match listener.accept() {
+                Ok((mut stream, _)) => match rustls::ServerConnection::new(config) {
+                    Ok(mut connection) => connection
+                        .complete_io(&mut stream)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error.to_string()),
+            };
+            // Most tests only need the client-side result and deliberately
+            // discard this receiver. The mutual-TLS test asserts it below.
+            let _ = handshake_result_tx.send(result);
         });
-        Endpoint::new("127.0.0.1", port)
+        (Endpoint::new("127.0.0.1", port), handshake_result_rx)
     }
 
     /// Full client-side TLS path with the fixture cert as trusted root and
@@ -855,7 +861,7 @@ mod tls_tests {
     /// certificate completes the handshake.
     #[test]
     fn tls_client_identity_handshake_succeeds() {
-        let endpoint = tls_acceptor(true);
+        let (endpoint, server_handshake) = tls_acceptor(true);
         let options = ConnectionOptions {
             connect_timeout: Duration::from_millis(500),
             protocol: RpcProtocol::Binary,
@@ -869,17 +875,21 @@ mod tls_tests {
         };
         let connection = Connection::open(endpoint, &options).expect("TLS handshake with identity");
         assert_eq!(connection.protocol(), RpcProtocol::Binary);
+        server_handshake
+            .recv_timeout(Duration::from_secs(5))
+            .expect("server handshake result")
+            .expect("server accepted client identity");
     }
 
     /// Setting only one of the client cert/key pair is a config error
     /// caught before any I/O.
     #[test]
     fn tls_client_identity_requires_both_paths() {
-        let endpoint = tls_acceptor_once();
         for (cert, key) in [
             (Some(fixture("client-cert.pem")), None),
             (None, Some(fixture("client-key.pem"))),
         ] {
+            let endpoint = tls_acceptor_once();
             let options = ConnectionOptions {
                 connect_timeout: Duration::from_millis(500),
                 protocol: RpcProtocol::Binary,
