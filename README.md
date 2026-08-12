@@ -185,10 +185,9 @@ It must match the **server** setting `dn_rpc_thrift_compression_enable` (default
 
 **TLS** is behind the `tls` cargo feature. It uses [`rustls`](https://crates.io/crates/rustls)
 with the `ring` crypto provider and supports TLS 1.2/1.3. Server certificates are
-verified with [`rustls-platform-verifier`](https://crates.io/crates/rustls-platform-verifier),
-so the platform trust store and verification policy are used where available;
-on Linux/BSD, platform roots are loaded and verified with WebPKI. A CA supplied
-through `ca_cert_path` is added to those platform roots.
+verified consistently with rustls/WebPKI on every platform. The native trust roots
+are loaded with [`rustls-native-certs`](https://crates.io/crates/rustls-native-certs),
+and a CA supplied through `ca_cert_path` is added to those roots.
 
 ```toml
 iotdb-client-rust = { version = "0.1", features = ["tls"] }

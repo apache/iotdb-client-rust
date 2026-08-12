@@ -185,10 +185,9 @@ let config = SessionConfig { enable_rpc_compression: true, ..Default::default() 
 
 **TLS** 位于 `tls` cargo feature 之后。其底层使用
 [`rustls`](https://crates.io/crates/rustls) 和 `ring` 密码学 provider，支持
-TLS 1.2/1.3。服务端证书通过
-[`rustls-platform-verifier`](https://crates.io/crates/rustls-platform-verifier)
-校验：在支持的平台上使用系统信任库及校验策略；在 Linux/BSD 上加载系统根证书并通过
-WebPKI 校验。`ca_cert_path` 指定的 CA 会追加到系统根证书中。
+TLS 1.2/1.3。所有平台均使用 rustls/WebPKI 执行一致的服务端证书校验；系统信任根通过
+[`rustls-native-certs`](https://crates.io/crates/rustls-native-certs) 加载，
+`ca_cert_path` 指定的 CA 会追加到这些信任根中。
 
 ```toml
 iotdb-client-rust = { version = "0.1", features = ["tls"] }

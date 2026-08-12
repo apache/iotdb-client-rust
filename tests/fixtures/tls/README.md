@@ -28,32 +28,30 @@ Not secrets — the keys never protect anything.
 | `cert.pem` + `key.pem` | server identity (loopback rustls server, live-server keystore) |
 | `client-cert.pem` + `client-key.pem` | client identity for the mutual-TLS tests |
 
-The macOS verifier used by `rustls-platform-verifier` imposes extra
-requirements even on explicitly trusted roots: validity ≤ 825 days
-(error −67901) and an
-`extendedKeyUsage=serverAuth` extension (error −67609). Current cert
-expires **2028-10-10**; when the trusted-root test starts failing with a
-validity/expiry error, regenerate:
+The current server certificate expires **2028-11-09**. Regenerate it before
+then with the extensions required by the WebPKI verifier:
 
 ```sh
 cd tests/fixtures/tls
 openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
   -days 820 -nodes -subj "/CN=localhost" \
+  -addext "basicConstraints=critical,CA:FALSE" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
   -addext "extendedKeyUsage=serverAuth" \
-  -addext "keyUsage=digitalSignature,keyEncipherment"
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment"
 ```
 
-The client certificate (expires **2028-10-10** as well) is a standalone
-self-signed test CA and client identity. The rustls loopback server trusts it
-as a root and requires it during the mutual-TLS test:
+The client certificate (expires **2028-11-09** as well) is a standalone
+self-signed client identity. The rustls loopback server explicitly trusts it
+and requires it during the mutual-TLS test:
 
 ```sh
 cd tests/fixtures/tls
 openssl req -x509 -newkey rsa:2048 -keyout client-key.pem -out client-cert.pem \
   -days 820 -nodes -subj "/CN=iotdb-client-rust-test-client" \
+  -addext "basicConstraints=critical,CA:FALSE" \
   -addext "extendedKeyUsage=clientAuth" \
-  -addext "keyUsage=digitalSignature,keyEncipherment"
+  -addext "keyUsage=critical,digitalSignature,keyEncipherment"
 ```
 
 ## Live TLS server keystore

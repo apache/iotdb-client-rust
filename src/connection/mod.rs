@@ -35,7 +35,10 @@ use rustls::crypto::WebPkiSupportedAlgorithms;
 #[cfg(feature = "tls")]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[cfg(feature = "tls")]
-use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned};
+use rustls::{
+    ClientConfig, ClientConnection, DigitallySignedStruct, RootCertStore, SignatureScheme,
+    StreamOwned,
+};
 
 use thrift::protocol::{
     TBinaryInputProtocol, TBinaryOutputProtocol, TCompactInputProtocol, TCompactOutputProtocol,
@@ -309,13 +312,28 @@ fn tls_client_config(tls: &TlsOptions) -> Result<Arc<ClientConfig>> {
             provider.signature_verification_algorithms,
         ))
     } else {
-        Arc::new(
-            rustls_platform_verifier::Verifier::new_with_extra_roots(
-                extra_roots,
-                Arc::clone(&provider),
-            )
-            .map_err(|e| Error::Tls(e.to_string()))?,
+        let native_roots = rustls_native_certs::load_native_certs();
+        for error in native_roots.errors {
+            log::warn!("cannot load a native CA certificate: {error}");
+        }
+
+        let mut roots = RootCertStore::empty();
+        let (_, ignored) = roots.add_parsable_certificates(native_roots.certs);
+        if ignored != 0 {
+            log::warn!("ignored {ignored} native CA certificate(s) that WebPKI cannot parse");
+        }
+        for certificate in extra_roots {
+            roots
+                .add(certificate)
+                .map_err(|e| Error::Tls(format!("cannot add CA certificate: {e}")))?;
+        }
+
+        rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::clone(&provider),
         )
+        .build()
+        .map_err(|e| Error::Tls(e.to_string()))?
     };
 
     let builder = ClientConfig::builder_with_provider(provider)
