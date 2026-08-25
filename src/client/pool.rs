@@ -204,11 +204,26 @@ impl SessionPool {
     /// the acquire retried; a fresh session is opened while under
     /// `max_size`.
     pub fn acquire(&self) -> Result<PooledSession<'_>> {
-        let deadline = Instant::now() + self.config.acquire_timeout;
+        // `checked_add` makes `acquire_timeout = Duration::MAX` mean
+        // "wait without a deadline" instead of panicking on Instant overflow.
+        let deadline = Instant::now().checked_add(self.config.acquire_timeout);
+        let mut last_err: Option<Error> = None;
         let mut state = self.state.lock().expect("pool lock poisoned");
         loop {
             if state.closed {
                 return Err(Error::Client("session pool is closed".into()));
+            }
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline {
+                    return Err(last_err.unwrap_or_else(|| {
+                        Error::Client(format!(
+                            "pool exhausted: no session available within {:?} ({} live, max {})",
+                            self.config.acquire_timeout,
+                            self.live.load(Ordering::Relaxed),
+                            self.config.max_size
+                        ))
+                    }));
+                }
             }
             let expired = self.sweep_idle(&mut state);
             if !expired.is_empty() {
@@ -220,12 +235,25 @@ impl SessionPool {
                 continue; // re-check closed/idle after re-locking
             }
             // Idle session available → validate liveness, evict the dead.
-            while let Some(entry) = state.idle.pop_front() {
+            if let Some(entry) = state.idle.pop_front() {
                 if entry.session.is_open() {
                     drop(state);
-                    return self.hand_out(entry.session);
+                    match self.hand_out(entry.session) {
+                        Ok(guard) => return Ok(guard),
+                        Err(e) => {
+                            // Account under the lock, then keep spending the
+                            // acquire_timeout budget on the remaining idle
+                            // candidates instead of failing instantly.
+                            last_err = Some(e);
+                            state = self.state.lock().expect("pool lock poisoned");
+                            self.live.fetch_sub(1, Ordering::Relaxed);
+                            self.available.notify_one();
+                            continue;
+                        }
+                    }
                 }
                 self.live.fetch_sub(1, Ordering::Relaxed);
+                continue; // dead session discarded; retry
             }
             // Below capacity → grow lazily. Count the slot while still
             // holding the lock so concurrent acquires cannot overshoot.
@@ -233,29 +261,57 @@ impl SessionPool {
                 self.live.fetch_add(1, Ordering::Relaxed);
                 drop(state);
                 match self.open_session() {
-                    Ok(session) => return self.hand_out(session),
+                    Ok(session) => match self.hand_out(session) {
+                        Ok(guard) => return Ok(guard),
+                        Err(e) => {
+                            let state = self.state.lock().expect("pool lock poisoned");
+                            self.live.fetch_sub(1, Ordering::Relaxed);
+                            self.available.notify_one();
+                            drop(state);
+                            // A broken USE replay is a terminal error for
+                            // this acquire: report it directly.
+                            return Err(e);
+                        }
+                    },
                     Err(e) => {
+                        last_err = Some(e);
+                        state = self.state.lock().expect("pool lock poisoned");
                         self.live.fetch_sub(1, Ordering::Relaxed);
                         self.available.notify_one();
-                        return Err(e);
+                        // Spend the remaining acquire_timeout budget waiting
+                        // for a release instead of failing immediately; the
+                        // loop re-checks closed/idle/deadline at the top.
+                        state = self.wait_for_change(state, deadline);
                     }
                 }
+                continue;
             }
             // At capacity → wait for a release, bounded by the deadline.
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(Error::Client(format!(
-                    "pool exhausted: no session available within {:?} ({} live, max {})",
-                    self.config.acquire_timeout,
-                    self.live.load(Ordering::Relaxed),
-                    self.config.max_size
-                )));
+            state = self.wait_for_change(state, deadline);
+        }
+    }
+
+    /// Park on the availability Condvar until a release or (when a deadline
+    /// is set) the deadline passes. The returned guard still holds the state
+    /// lock so the caller re-evaluates the predicate safely.
+    fn wait_for_change<'a>(
+        &self,
+        state: std::sync::MutexGuard<'a, PoolState>,
+        deadline: Option<Instant>,
+    ) -> std::sync::MutexGuard<'a, PoolState> {
+        match deadline {
+            Some(deadline) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return state;
+                }
+                let (guard, _) = self
+                    .available
+                    .wait_timeout(state, deadline - now)
+                    .expect("pool lock poisoned");
+                guard
             }
-            let (guard, _) = self
-                .available
-                .wait_timeout(state, deadline - now)
-                .expect("pool lock poisoned");
-            state = guard;
+            None => self.available.wait(state).expect("pool lock poisoned"),
         }
     }
 
@@ -271,24 +327,45 @@ impl SessionPool {
     /// connection to the hinted endpoint (Node.js-style dedicated
     /// per-endpoint sessions are future work).
     pub fn acquire_for_device(&self, device_id: &str) -> Result<PooledSession<'_>> {
-        {
+        let matched = {
             let mut state = self.state.lock().expect("pool lock poisoned");
-            if !state.closed {
+            if state.closed {
+                None
+            } else {
                 // Any idle session may hold the hint (the one that got the
                 // 400), not necessarily one connected to the hinted node.
+                // When several sessions hold conflicting hints, prefer the
+                // newest (highest cache seq).
                 let hint = state
                     .idle
                     .iter_mut()
-                    .find_map(|e| e.session.redirect_hint(device_id));
-                if let Some(endpoint) = hint {
-                    let matching = state.idle.iter().position(|e| {
-                        e.session.is_open() && e.session.current_endpoint() == Some(&endpoint)
-                    });
-                    if let Some(pos) = matching {
-                        let entry = state.idle.remove(pos).expect("index in bounds");
-                        drop(state);
-                        return self.hand_out(entry.session);
-                    }
+                    .filter_map(|e| e.session.redirect_hint_with_seq(device_id))
+                    .max_by_key(|(_, seq)| *seq);
+                match hint {
+                    Some((endpoint, _)) => state
+                        .idle
+                        .iter()
+                        .position(|e| {
+                            e.session.is_open()
+                                && e.session
+                                    .current_endpoint()
+                                    .is_some_and(|current| current.equivalent(&endpoint))
+                        })
+                        .map(|pos| state.idle.remove(pos).expect("index in bounds").session),
+                    None => None,
+                }
+            }
+        };
+        if let Some(session) = matched {
+            match self.hand_out(session) {
+                Ok(guard) => return Ok(guard),
+                Err(_) => {
+                    // Account under the lock, then fall back to the normal
+                    // acquire path (the hinted hand-out may still succeed).
+                    let state = self.state.lock().expect("pool lock poisoned");
+                    self.live.fetch_sub(1, Ordering::Relaxed);
+                    self.available.notify_one();
+                    drop(state);
                 }
             }
         }
@@ -305,16 +382,20 @@ impl SessionPool {
     /// sessions. Sessions currently handed out are closed when their guards
     /// drop.
     pub fn close(&self) {
+        // Set the flag, decrement `live` and wake every waiter under the
+        // same lock the waiters re-check the predicate under (no lost
+        // Condvar wakeups); the blocking closeSession RPCs run after the
+        // lock is released, bounded by the session's socket_timeout.
         let drained = {
             let mut state = self.state.lock().expect("pool lock poisoned");
             state.closed = true;
+            self.live.fetch_sub(state.idle.len(), Ordering::Relaxed);
+            self.available.notify_all();
             std::mem::take(&mut state.idle)
         };
-        self.live.fetch_sub(drained.len(), Ordering::Relaxed);
         for mut entry in drained {
             let _ = entry.session.close();
         }
-        self.available.notify_all();
     }
 
     fn open_session(&self) -> Result<Session> {
@@ -329,19 +410,22 @@ impl SessionPool {
 
     /// Final step of acquire: sync the session onto the pool's current
     /// database before handing it out. On USE failure the session is
-    /// discarded, not returned to the pool.
+    /// discarded, not returned to the pool; the caller re-takes the state
+    /// lock to decrement `live` and notify, keeping the decrement and the
+    /// predicate waiters re-evaluate under the same lock.
     fn hand_out(&self, mut session: Session) -> Result<PooledSession<'_>> {
         let pool_db = self.database.lock().expect("pool lock poisoned").clone();
         if let Some(db) = pool_db {
             if session.database() != Some(db.as_str()) {
                 if let Err(e) = session.execute_non_query(&format!("USE {db}")) {
                     let _ = session.close();
-                    self.live.fetch_sub(1, Ordering::Relaxed);
-                    self.available.notify_one();
                     return Err(e);
                 }
             }
         }
+        // Pooled sessions skip the reconnect pacing sleeps so a pool slot is
+        // never held for the full C#-style reconnect walk.
+        session.mark_pooled();
         Ok(PooledSession {
             pool: self,
             session: Some(session),
@@ -352,8 +436,10 @@ impl SessionPool {
     /// live ones update the pool database and go back to the idle queue.
     fn release(&self, session: Session) {
         if !session.is_open() {
+            let state = self.state.lock().expect("pool lock poisoned");
             self.live.fetch_sub(1, Ordering::Relaxed);
             self.available.notify_one();
+            drop(state);
             return;
         }
         if let Some(db) = session.database() {
@@ -364,19 +450,20 @@ impl SessionPool {
         }
         let mut state = self.state.lock().expect("pool lock poisoned");
         if state.closed {
-            drop(state);
             self.live.fetch_sub(1, Ordering::Relaxed);
+            self.available.notify_one();
+            drop(state);
             let mut session = session;
             let _ = session.close();
         } else {
             state.idle.push_back(IdleEntry::new(session));
             let expired = self.sweep_idle(&mut state);
+            self.available.notify_one();
             drop(state);
             for mut session in expired {
                 let _ = session.close();
             }
         }
-        self.available.notify_one();
     }
 
     /// Test hook: push a pre-built session (possibly dead) into the idle
@@ -454,6 +541,14 @@ impl TableSessionPool {
         self.pool.acquire()
     }
 
+    /// Acquire a table-dialect session for writes to `device_id`,
+    /// preferring an idle session already connected to the device's
+    /// redirected endpoint — the table-model counterpart of
+    /// [`SessionPool::acquire_for_device`].
+    pub fn acquire_for_device(&self, device_id: &str) -> Result<PooledSession<'_>> {
+        self.pool.acquire_for_device(device_id)
+    }
+
     /// Convenience: acquire, run one non-query statement, release.
     pub fn execute_non_query(&self, sql: &str) -> Result<()> {
         self.pool.execute_non_query(sql)
@@ -503,6 +598,91 @@ mod tests {
         assert_eq!(cfg.acquire_timeout, Duration::from_secs(60));
         assert_eq!(cfg.max_idle_time, Duration::from_secs(60));
         assert_eq!(cfg.idle_sweep_interval, Duration::from_secs(30));
+    }
+
+    /// F5: a failed growth attempt must spend the acquire_timeout budget
+    /// (waiting for a release) instead of failing instantly — the old
+    /// behaviour returned the connect error in ~200us against a 300ms budget.
+    #[test]
+    fn growth_failure_spends_acquire_timeout_budget() {
+        let cfg = SessionPoolConfig {
+            max_size: 1,
+            acquire_timeout: Duration::from_millis(300),
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let pool = SessionPool::new(cfg).unwrap();
+        let started = Instant::now();
+        match pool.acquire() {
+            Err(Error::Thrift(_)) => {}
+            other => panic!("expected thrift connect error, got {other:?}"),
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "acquire failed in {elapsed:?} instead of spending the budget"
+        );
+        assert_eq!(pool.live_count(), 0);
+    }
+
+    /// F6: waiters blocked on a full pool must be woken by `close()`
+    /// promptly — the wakeup cannot depend on the blocking closeSession RPCs
+    /// that run afterwards (the old code notified only after them).
+    #[test]
+    fn close_wakes_waiters_promptly() {
+        let ep = fake_listener();
+        let cfg = SessionPoolConfig {
+            max_size: 1,
+            acquire_timeout: Duration::from_secs(10),
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let pool = std::sync::Arc::new(SessionPool::new(cfg).unwrap());
+        pool.inject_idle(injected_session(&ep));
+        let _held = pool.acquire().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter_pool = std::sync::Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || {
+            let _ = tx.send(waiter_pool.acquire().map(|_| ()));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        pool.close();
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Err(Error::Client(msg))) => assert!(msg.contains("closed"), "{msg}"),
+            other => panic!("waiter should get the closed-pool error promptly, got {other:?}"),
+        }
+        waiter.join().expect("waiter thread");
+    }
+
+    /// F13: `acquire_timeout = Duration::MAX` must mean "wait without a
+    /// deadline", not panic on `Instant + Duration` overflow. The close
+    /// below is what releases the waiter.
+    #[test]
+    fn acquire_timeout_max_waits_until_closed_without_panicking() {
+        let ep = fake_listener();
+        let cfg = SessionPoolConfig {
+            max_size: 1,
+            acquire_timeout: Duration::MAX,
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let pool = std::sync::Arc::new(SessionPool::new(cfg).unwrap());
+        pool.inject_idle(injected_session(&ep));
+        let _held = pool.acquire().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter_pool = std::sync::Arc::clone(&pool);
+        let waiter = std::thread::spawn(move || {
+            let _ = tx.send(waiter_pool.acquire().map(|_| ()));
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        pool.close();
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Err(Error::Client(msg))) => assert!(msg.contains("closed"), "{msg}"),
+            other => panic!("Duration::MAX waiter should wake on close, got {other:?}"),
+        }
+        waiter.join().expect("waiter thread");
     }
 
     #[test]
@@ -663,6 +843,41 @@ mod tests {
         // Unknown device → plain FIFO acquire (the session on A).
         let guard = pool.acquire_for_device("root.sg.unknown").unwrap();
         assert_eq!(guard.current_endpoint(), Some(&ep_a));
+    }
+
+    /// F12: when idle sessions hold conflicting hints for one device, the
+    /// **newest** hint wins, not the session nearest the queue head.
+    #[test]
+    fn acquire_for_device_prefers_newest_conflicting_hint() {
+        let ep_x = fake_listener();
+        let ep_y = fake_listener();
+        let ep_b = fake_listener();
+        let ep_c = fake_listener();
+
+        let cfg = SessionPoolConfig {
+            max_size: 4,
+            acquire_timeout: Duration::from_millis(50),
+            session: dead_endpoint_config(),
+            ..Default::default()
+        };
+        let pool = SessionPool::new(cfg).unwrap();
+
+        // Older hint (inserted first, process-wide seq 1) points at B.
+        let mut s_old_hint = injected_session(&ep_x);
+        s_old_hint.test_inject_redirect_hint("root.sg.d1", ep_b.clone());
+        // Newer hint (seq 2) points at C. Both hint-holders precede the
+        // hinted sessions in the idle queue, so queue position would pick B.
+        let mut s_new_hint = injected_session(&ep_y);
+        s_new_hint.test_inject_redirect_hint("root.sg.d1", ep_c.clone());
+        let s_on_b = injected_session(&ep_b);
+        let s_on_c = injected_session(&ep_c);
+        pool.inject_idle(s_old_hint);
+        pool.inject_idle(s_new_hint);
+        pool.inject_idle(s_on_b);
+        pool.inject_idle(s_on_c);
+
+        let guard = pool.acquire_for_device("root.sg.d1").unwrap();
+        assert_eq!(guard.current_endpoint(), Some(&ep_c));
     }
 
     #[test]

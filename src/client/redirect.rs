@@ -30,6 +30,7 @@
 //! future work.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::connection::Endpoint;
@@ -39,6 +40,11 @@ use crate::protocol::common::{TEndPoint, TSStatus};
 pub const DEFAULT_REDIRECT_TTL: Duration = Duration::from_secs(300);
 /// Default capacity; the oldest entry is evicted when full.
 pub const DEFAULT_REDIRECT_MAX_ENTRIES: usize = 1024;
+
+/// Process-wide insertion counter: `seq` values stay comparable across
+/// per-session caches, so a pool can tell which of two conflicting hints
+/// for one device is newer.
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// TTL predicate, kept as a pure function so expiry logic is testable
 /// without sleeping: an entry is expired once `elapsed` exceeds `ttl`.
@@ -68,7 +74,6 @@ pub struct RedirectCache {
     entries: HashMap<String, Entry>,
     ttl: Duration,
     max_entries: usize,
-    seq: u64,
 }
 
 impl Default for RedirectCache {
@@ -85,7 +90,6 @@ impl RedirectCache {
             entries: HashMap::new(),
             ttl,
             max_entries,
-            seq: 0,
         }
     }
 
@@ -95,15 +99,27 @@ impl RedirectCache {
         self.get_at(device_id, Instant::now())
     }
 
+    /// Like [`RedirectCache::get`], plus the insertion sequence — higher
+    /// is newer. Pools use it to prefer the newest hint when idle sessions
+    /// hold conflicting hints for one device.
+    pub fn get_with_seq(&mut self, device_id: &str) -> Option<(Endpoint, u64)> {
+        self.get_at_with_seq(device_id, Instant::now())
+    }
+
     /// [`RedirectCache::get`] against an explicit "now" — the seam the TTL
     /// tests use instead of sleeping.
     fn get_at(&mut self, device_id: &str, now: Instant) -> Option<Endpoint> {
+        self.get_at_with_seq(device_id, now)
+            .map(|(endpoint, _)| endpoint)
+    }
+
+    fn get_at_with_seq(&mut self, device_id: &str, now: Instant) -> Option<(Endpoint, u64)> {
         let entry = self.entries.get(device_id)?;
         if is_expired(now.saturating_duration_since(entry.inserted), self.ttl) {
             self.entries.remove(device_id);
             return None;
         }
-        Some(entry.endpoint.clone())
+        Some((entry.endpoint.clone(), entry.seq))
     }
 
     /// Record (or refresh) the hint for `device_id`. When the cache is full
@@ -123,13 +139,13 @@ impl RedirectCache {
                 self.entries.remove(&oldest);
             }
         }
-        self.seq += 1;
+        let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
         self.entries.insert(
             device_id,
             Entry {
                 endpoint,
                 inserted: Instant::now(),
-                seq: self.seq,
+                seq,
             },
         );
     }

@@ -102,6 +102,23 @@ impl TableSessionBuilder {
         self
     }
 
+    /// Client-side bound on each socket read/write (SO_RCVTIMEO/SO_SNDTIMEO),
+    /// applied after the TCP connect and before the TLS handshake.
+    /// See [`SessionConfig::socket_timeout`].
+    pub fn socket_timeout(mut self, timeout: Duration) -> Self {
+        self.config.socket_timeout = Some(timeout);
+        self
+    }
+
+    /// Redirect-hint cache TTL and capacity.
+    /// See [`SessionConfig::redirect_cache_ttl`] /
+    /// [`SessionConfig::redirect_cache_max_entries`].
+    pub fn redirect_cache(mut self, ttl: Duration, max_entries: usize) -> Self {
+        self.config.redirect_cache_ttl = ttl;
+        self.config.redirect_cache_max_entries = max_entries;
+        self
+    }
+
     pub fn query_timeout_ms(mut self, timeout_ms: i64) -> Self {
         self.config.query_timeout_ms = timeout_ms;
         self
