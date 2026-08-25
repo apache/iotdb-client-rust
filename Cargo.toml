@@ -36,6 +36,8 @@ thrift = "0.23"
 byteorder = "1.5"
 chrono = "0.4"
 log = "0.4"
+# SO_RCVTIMEO/SO_SNDTIMEO + SO_KEEPALIVE on the blocking TcpStream.
+socket2 = "0.5"
 # thrift 0.23 allows any uuid 1.x; 1.21+ raises MSRV to Rust 1.85.
 uuid = "=1.20.0"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }

@@ -172,6 +172,25 @@ cargo run --example table_session
 cargo run --example session_pool
 ```
 
+## 超时与连接活性
+
+`connect_timeout` 限定每个端点的 TCP 建连时长。`socket_timeout`（默认 60 s）限定建连之后的
+**每一次阻塞式 socket 读写**——包括 TLS 握手、所有 RPC 读取，以及会话销毁时发送的尽力而为
+`closeSession`——因此"接受连接后保持沉默"的对端不会再让客户端无限阻塞。设为 `None`
+可恢复旧的无限阻塞行为（0 与 `None` 等价）。
+
+```rust
+let config = SessionConfig {
+    connect_timeout: std::time::Duration::from_secs(10),
+    socket_timeout: Some(std::time::Duration::from_secs(30)),
+    ..Default::default()
+};
+// 或：TableSession::builder().connect_timeout(..).socket_timeout(..)
+```
+
+传输层失败时，若 `enable_auto_reconnect`（默认 `true`）开启，会话会重连并重试该操作一次；
+未开启自动重连时，连接会被标记为已损坏，连接池将丢弃该会话而不是再次发放。
+
 ## TLS 与 RPC 压缩
 
 **RPC 压缩**（IoTDB 术语，实为 Thrift *compact 协议*）只是一个配置开关：

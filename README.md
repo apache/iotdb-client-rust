@@ -172,6 +172,29 @@ cargo run --example table_session
 cargo run --example session_pool
 ```
 
+## Timeouts & liveness
+
+`connect_timeout` bounds the TCP connect per endpoint attempt. `socket_timeout`
+(default 60 s) bounds **every blocking socket read/write after that** — the TLS
+handshake, every RPC read, and the best-effort `closeSession` sent when a
+session is dropped — so a peer that accepts the connection and then goes silent
+cannot hang the client forever. Set it to `None` to restore the old unbounded
+blocking behaviour (zero is treated the same as `None`).
+
+```rust
+let config = SessionConfig {
+    connect_timeout: std::time::Duration::from_secs(10),
+    socket_timeout: Some(std::time::Duration::from_secs(30)),
+    ..Default::default()
+};
+// or: TableSession::builder().connect_timeout(..).socket_timeout(..)
+```
+
+On a transport-level failure with `enable_auto_reconnect` (default `true`) the
+session reconnects and retries the operation once; without auto-reconnect the
+connection is marked broken and pools discard the session instead of handing it
+out again.
+
 ## TLS & RPC compression
 
 **RPC compression** (IoTDB's term for the Thrift *compact protocol*) is a plain config flag:

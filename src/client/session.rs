@@ -56,10 +56,21 @@ pub struct SessionConfig {
     pub sql_dialect: String,
     pub fetch_size: i32,
     pub zone_id: String,
-    /// TCP connect timeout per endpoint attempt.
+    /// Total TCP connect timeout per endpoint attempt.
     pub connect_timeout: Duration,
+    /// Client-side bound on each blocking socket read/write
+    /// (SO_RCVTIMEO/SO_SNDTIMEO), applied after the TCP connect and before
+    /// the TLS handshake: it bounds the handshake, every RPC read and the
+    /// best-effort drop-time `closeSession`. `None` restores unbounded
+    /// blocking. Default 60 s.
+    pub socket_timeout: Option<Duration>,
     /// Per-query server-side timeout in milliseconds (request body field).
     pub query_timeout_ms: i64,
+    /// Redirect-hint cache TTL. Default 300 s (Node.js `RedirectCache`).
+    pub redirect_cache_ttl: Duration,
+    /// Redirect-hint cache capacity (oldest entry evicted when full);
+    /// `0` disables the cache. Default 1024.
+    pub redirect_cache_max_entries: usize,
     /// Database to select at open time (table dialect; sent as config key `db`).
     pub database: Option<String>,
     /// Reopen the connection and retry an op once when an RPC fails at the
@@ -116,7 +127,10 @@ impl Default for SessionConfig {
             fetch_size: 1024,
             zone_id: "UTC+8".into(),
             connect_timeout: Duration::from_secs(10),
+            socket_timeout: Some(Duration::from_secs(60)),
             query_timeout_ms: 60_000,
+            redirect_cache_ttl: redirect::DEFAULT_REDIRECT_TTL,
+            redirect_cache_max_entries: redirect::DEFAULT_REDIRECT_MAX_ENTRIES,
             database: None,
             enable_auto_reconnect: true,
             max_reconnect_attempts: 3,
@@ -155,6 +169,7 @@ impl SessionConfig {
     pub fn connection_options(&self) -> ConnectionOptions {
         ConnectionOptions {
             connect_timeout: self.connect_timeout,
+            socket_timeout: self.socket_timeout,
             protocol: if self.enable_rpc_compression {
                 RpcProtocol::Compact
             } else {
@@ -204,11 +219,21 @@ pub struct Session {
     last_endpoint: Option<Endpoint>,
     /// Device → endpoint hints harvested from status-400 insert responses.
     redirect_cache: RedirectCache,
+    /// A transport-level RPC failure was observed and the connection is
+    /// presumed desynchronized; with auto-reconnect off there is no reopen
+    /// path, so `is_open` reports false and pools discard the session.
+    broken: bool,
+    /// This session is handed out from a pool: reconnect skips the
+    /// between-attempt sleeps so a pool slot is not held for the full
+    /// C#-style pacing (pool.rs).
+    pooled: bool,
 }
 
 impl Session {
     pub fn new(config: SessionConfig) -> Self {
         let database = config.database.clone();
+        let redirect_cache =
+            RedirectCache::new(config.redirect_cache_ttl, config.redirect_cache_max_entries);
         Self {
             config,
             connection: None,
@@ -216,7 +241,9 @@ impl Session {
             statement_id: -1,
             database,
             last_endpoint: None,
-            redirect_cache: RedirectCache::default(),
+            redirect_cache,
+            broken: false,
+            pooled: false,
         }
     }
 
@@ -233,28 +260,33 @@ impl Session {
 
         let start = ENDPOINT_START_INDEX.fetch_add(1, Ordering::Relaxed) % n;
         let options = self.config.connection_options();
-        let mut connection = None;
         let mut last_err: Option<Error> = None;
+        // Fail over at the *full* handshake level, not just TCP: a node that
+        // accepts the connection but rejects openSession must not fail the
+        // whole open while other nodes are healthy (reconnect() has always
+        // retried connect + authenticate together).
         for i in 0..n {
             let endpoint = self.config.endpoints[(start + i) % n].clone();
-            match Connection::open(endpoint, &options) {
-                Ok(c) => {
-                    connection = Some(c);
-                    break;
+            let result = Connection::open(endpoint.clone(), &options).and_then(|mut connection| {
+                let ids = self.authenticate(&mut connection)?;
+                Ok((connection, ids))
+            });
+            match result {
+                Ok((connection, (session_id, statement_id))) => {
+                    self.session_id = session_id;
+                    self.statement_id = statement_id;
+                    self.last_endpoint = Some(connection.endpoint().clone());
+                    self.connection = Some(connection);
+                    self.broken = false;
+                    return Ok(());
                 }
-                Err(e) => last_err = Some(e),
+                Err(e) => {
+                    log::warn!("open against {endpoint} failed: {e}");
+                    last_err = Some(e);
+                }
             }
         }
-        let mut connection = connection.ok_or_else(|| {
-            last_err.unwrap_or_else(|| Error::Client("no endpoints configured".into()))
-        })?;
-
-        let (session_id, statement_id) = self.authenticate(&mut connection)?;
-        self.session_id = session_id;
-        self.statement_id = statement_id;
-        self.last_endpoint = Some(connection.endpoint().clone());
-        self.connection = Some(connection);
-        Ok(())
+        Err(last_err.unwrap_or_else(|| Error::Client("no endpoints configured".into())))
     }
 
     /// Handshake on a fresh connection: `openSession` (dialect + current
@@ -298,6 +330,7 @@ impl Session {
     /// (mirroring the C# SDK's `Reconnect`).
     fn reconnect(&mut self) -> Result<()> {
         self.connection = None; // drop closes the old transport
+        self.broken = false;
         let n = self.config.endpoints.len();
         if n == 0 {
             return Err(Error::Client("no endpoints configured".into()));
@@ -311,7 +344,10 @@ impl Session {
         let options = self.config.connection_options();
         let mut last_err: Option<Error> = None;
         for attempt in 0..attempts {
-            if attempt > 0 {
+            // Pooled sessions hold their pool slot during reconnect; skip
+            // the pacing sleeps so a full reconnect walk cannot monopolize
+            // the slot for tens of seconds.
+            if attempt > 0 && !self.pooled {
                 std::thread::sleep(self.config.retry_interval);
             }
             for i in 0..n {
@@ -327,6 +363,7 @@ impl Session {
                         self.statement_id = statement_id;
                         self.last_endpoint = Some(connection.endpoint().clone());
                         self.connection = Some(connection);
+                        self.broken = false;
                         return Ok(());
                     }
                     Err(e) => {
@@ -353,11 +390,26 @@ impl Session {
             {
                 e
             }
+            Err(e @ Error::Thrift(_)) => {
+                // No reconnect path: the connection may be desynchronized
+                // (a socket timeout abandons a half-read frame; a
+                // frame-too-large rejection abandons an undrained body).
+                // Mark it broken so is_open() turns false and pools
+                // discard the session instead of handing it out again.
+                self.broken = true;
+                return Err(e);
+            }
             other => return other,
         };
         log::warn!("RPC failed at transport level ({original}); reconnecting");
         match self.reconnect() {
-            Ok(()) => op(self),
+            Ok(()) => match op(self) {
+                Err(e @ Error::Thrift(_)) => {
+                    self.broken = true;
+                    Err(e)
+                }
+                other => other,
+            },
             Err(reconnect_err) => {
                 log::warn!("reconnect failed ({reconnect_err}); surfacing the original error");
                 Err(original)
@@ -366,7 +418,7 @@ impl Session {
     }
 
     pub fn is_open(&self) -> bool {
-        self.connection.is_some()
+        self.connection.is_some() && !self.broken
     }
 
     /// The database currently selected on this session, if any.
@@ -379,6 +431,12 @@ impl Session {
         self.connection.as_ref().map(Connection::endpoint)
     }
 
+    /// Mark this session as pool-owned: reconnect skips the pacing sleeps
+    /// so a pool slot is not held for the full C#-style reconnect walk.
+    pub(crate) fn mark_pooled(&mut self) {
+        self.pooled = true;
+    }
+
     /// The cached redirect endpoint for `device_id`, if a status-400 insert
     /// response recommended one and the hint has not expired.
     ///
@@ -388,6 +446,13 @@ impl Session {
     /// [`crate::client::redirect`] for the routing-honesty note.
     pub fn redirect_hint(&mut self, device_id: &str) -> Option<Endpoint> {
         self.redirect_cache.get(device_id)
+    }
+
+    /// Like [`Session::redirect_hint`], but also returns the cache's
+    /// insertion sequence so pools can prefer the newest hint when idle
+    /// sessions hold conflicting hints for one device.
+    pub(crate) fn redirect_hint_with_seq(&mut self, device_id: &str) -> Option<(Endpoint, u64)> {
+        self.redirect_cache.get_with_seq(device_id)
     }
 
     /// Occupancy/config snapshot of the redirect cache.
@@ -484,7 +549,17 @@ impl Session {
             self.config.query_timeout_ms,
             self.statement_id,
         );
-        let resp = self.connection_mut()?.client_mut().fetch_results_v2(req)?;
+        let resp = match self.connection_mut()?.client_mut().fetch_results_v2(req) {
+            Ok(resp) => resp,
+            Err(e) => {
+                // fetch_results deliberately bypasses with_retry (spec
+                // gotcha #13: the result set is pinned to its node), so a
+                // transport-level failure here must still mark the
+                // connection broken for the pool.
+                self.broken = true;
+                return Err(Error::from(e));
+            }
+        };
         check_status(&resp.status)?;
         if !resp.has_result_set {
             return Ok((Vec::new(), false));
@@ -1020,6 +1095,197 @@ mod tests {
         TSStatus::new(code, None, None, None, None, None)
     }
 
+    /// A fake IoTDB handshake server for testing `Session::open` failover
+    /// without a live server: real Thrift framed messages, where the handler
+    /// can reject `openSession` on demand.
+    mod fake_auth_server {
+        use crate::connection::Endpoint;
+        use crate::protocol::client::*;
+        use crate::protocol::common;
+        use crate::protocol::common::TSStatus;
+        use std::collections::BTreeMap;
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
+        use thrift::server::TProcessor;
+        use thrift::transport::{
+            TFramedReadTransport, TFramedWriteTransport, TIoChannel, TTcpChannel,
+        };
+
+        struct FakeAuthHandler {
+            fail_open_session: bool,
+        }
+
+        fn ok_status() -> TSStatus {
+            TSStatus::new(200, None, None, None, None, None)
+        }
+
+        fn reject_status() -> TSStatus {
+            TSStatus::new(
+                1000,
+                Some("openSession rejected by test".into()),
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+
+        /// Compact impl for the handler methods the fake server never
+        /// dispatches: a declarative macro keeps this test module small.
+        macro_rules! fake_unimplemented_handlers {
+            ($( $name:ident ( $( $arg:ident : $ty:ty ),* ) : $ret:ty ; )*) => {
+                $(
+                    fn $name(&self $(, $arg: $ty)*) -> thrift::Result<$ret> {
+                        #[allow(unused_parens)]
+                        let _ = ($( $arg ),*);
+                        unimplemented!(
+                            "{} is not exercised by the fake handshake listener",
+                            stringify!($name)
+                        )
+                    }
+                )*
+            };
+        }
+
+        impl IClientRPCServiceSyncHandler for FakeAuthHandler {
+            fn handle_open_session(
+                &self,
+                _req: TSOpenSessionReq,
+            ) -> thrift::Result<TSOpenSessionResp> {
+                Ok(TSOpenSessionResp::new(
+                    if self.fail_open_session {
+                        reject_status()
+                    } else {
+                        ok_status()
+                    },
+                    TSProtocolVersion::IotdbServiceProtocolV3,
+                    if self.fail_open_session {
+                        None::<i64>
+                    } else {
+                        Some(1_i64)
+                    },
+                    None::<BTreeMap<String, String>>,
+                ))
+            }
+
+            fn handle_request_statement_id(&self, _session_id: i64) -> thrift::Result<i64> {
+                Ok(1)
+            }
+
+            fn handle_close_session(&self, _req: TSCloseSessionReq) -> thrift::Result<TSStatus> {
+                Ok(ok_status())
+            }
+
+            fake_unimplemented_handlers! {
+            handle_execute_query_statement_v2(req: TSExecuteStatementReq): TSExecuteStatementResp;
+            handle_execute_update_statement_v2(req: TSExecuteStatementReq): TSExecuteStatementResp;
+            handle_execute_statement_v2(req: TSExecuteStatementReq): TSExecuteStatementResp;
+            handle_execute_raw_data_query_v2(req: TSRawDataQueryReq): TSExecuteStatementResp;
+            handle_execute_last_data_query_v2(req: TSLastDataQueryReq): TSExecuteStatementResp;
+            handle_execute_fast_last_data_query_for_one_prefix_path(req: TSFastLastDataQueryForOnePrefixPathReq): TSExecuteStatementResp;
+            handle_execute_fast_last_data_query_for_one_device_v2(req: TSFastLastDataQueryForOneDeviceReq): TSExecuteStatementResp;
+            handle_execute_aggregation_query_v2(req: TSAggregationQueryReq): TSExecuteStatementResp;
+            handle_fetch_results_v2(req: TSFetchResultsReq): TSFetchResultsResp;
+            handle_execute_statement(req: TSExecuteStatementReq): TSExecuteStatementResp;
+            handle_execute_batch_statement(req: TSExecuteBatchStatementReq): common::TSStatus;
+            handle_execute_query_statement(req: TSExecuteStatementReq): TSExecuteStatementResp;
+            handle_execute_update_statement(req: TSExecuteStatementReq): TSExecuteStatementResp;
+            handle_fetch_results(req: TSFetchResultsReq): TSFetchResultsResp;
+            handle_fetch_metadata(req: TSFetchMetadataReq): TSFetchMetadataResp;
+            handle_cancel_operation(req: TSCancelOperationReq): common::TSStatus;
+            handle_close_operation(req: TSCloseOperationReq): common::TSStatus;
+            handle_prepare_statement(req: TSPrepareReq): TSPrepareResp;
+            handle_execute_prepared_statement(req: TSExecutePreparedReq): TSExecuteStatementResp;
+            handle_deallocate_prepared_statement(req: TSDeallocatePreparedReq): common::TSStatus;
+            handle_get_time_zone(session_id: i64): TSGetTimeZoneResp;
+            handle_set_time_zone(req: TSSetTimeZoneReq): common::TSStatus;
+            handle_get_properties(): ServerProperties;
+            handle_set_storage_group(session_id: i64, storage_group: String): common::TSStatus;
+            handle_create_timeseries(req: TSCreateTimeseriesReq): common::TSStatus;
+            handle_create_aligned_timeseries(req: TSCreateAlignedTimeseriesReq): common::TSStatus;
+            handle_create_multi_timeseries(req: TSCreateMultiTimeseriesReq): common::TSStatus;
+            handle_delete_timeseries(session_id: i64, path: Vec<String>): common::TSStatus;
+            handle_delete_storage_groups(session_id: i64, storage_group: Vec<String>): common::TSStatus;
+            handle_insert_record(req: TSInsertRecordReq): common::TSStatus;
+            handle_insert_string_record(req: TSInsertStringRecordReq): common::TSStatus;
+            handle_insert_tablet(req: TSInsertTabletReq): common::TSStatus;
+            handle_insert_tablets(req: TSInsertTabletsReq): common::TSStatus;
+            handle_insert_records(req: TSInsertRecordsReq): common::TSStatus;
+            handle_insert_records_of_one_device(req: TSInsertRecordsOfOneDeviceReq): common::TSStatus;
+            handle_insert_string_records_of_one_device(req: TSInsertStringRecordsOfOneDeviceReq): common::TSStatus;
+            handle_insert_string_records(req: TSInsertStringRecordsReq): common::TSStatus;
+            handle_test_insert_tablet(req: TSInsertTabletReq): common::TSStatus;
+            handle_test_insert_tablets(req: TSInsertTabletsReq): common::TSStatus;
+            handle_test_insert_record(req: TSInsertRecordReq): common::TSStatus;
+            handle_test_insert_string_record(req: TSInsertStringRecordReq): common::TSStatus;
+            handle_test_insert_records(req: TSInsertRecordsReq): common::TSStatus;
+            handle_test_insert_records_of_one_device(req: TSInsertRecordsOfOneDeviceReq): common::TSStatus;
+            handle_test_insert_string_records(req: TSInsertStringRecordsReq): common::TSStatus;
+            handle_delete_data(req: TSDeleteDataReq): common::TSStatus;
+            handle_execute_raw_data_query(req: TSRawDataQueryReq): TSExecuteStatementResp;
+            handle_execute_last_data_query(req: TSLastDataQueryReq): TSExecuteStatementResp;
+            handle_execute_aggregation_query(req: TSAggregationQueryReq): TSExecuteStatementResp;
+            handle_create_schema_template(req: TSCreateSchemaTemplateReq): common::TSStatus;
+            handle_append_schema_template(req: TSAppendSchemaTemplateReq): common::TSStatus;
+            handle_prune_schema_template(req: TSPruneSchemaTemplateReq): common::TSStatus;
+            handle_query_schema_template(req: TSQueryTemplateReq): TSQueryTemplateResp;
+            handle_show_configuration_template(): common::TShowConfigurationTemplateResp;
+            handle_show_configuration(node_id: i32): common::TShowConfigurationResp;
+            handle_set_schema_template(req: TSSetSchemaTemplateReq): common::TSStatus;
+            handle_unset_schema_template(req: TSUnsetSchemaTemplateReq): common::TSStatus;
+            handle_drop_schema_template(req: TSDropSchemaTemplateReq): common::TSStatus;
+            handle_create_timeseries_using_schema_template(req: TCreateTimeseriesUsingSchemaTemplateReq): common::TSStatus;
+            handle_handshake(info: TSyncIdentityInfo): common::TSStatus;
+            handle_send_pipe_data(buff: Vec<u8>): common::TSStatus;
+            handle_send_file(meta_info: TSyncTransportMetaInfo, buff: Vec<u8>): common::TSStatus;
+            handle_pipe_transfer(req: TPipeTransferReq): TPipeTransferResp;
+            handle_pipe_subscribe(req: TPipeSubscribeReq): TPipeSubscribeResp;
+            handle_get_backup_configuration(): TSBackupConfigurationResp;
+            handle_fetch_all_connections_info(): TSConnectionInfoResp;
+            handle_test_connection_empty_r_p_c(): common::TSStatus;
+            }
+        }
+        /// A listener that answers `openSession` + `requestStatementId`
+        /// (and `closeSession`) with real framed Thrift messages. When
+        /// `fail_first_connection` is set, the **first** connection gets a
+        /// rejected `openSession`; every later connection succeeds. The
+        /// acceptor thread is leaked; it ends with the test process.
+        pub fn auth_listener(fail_first_connection: bool) -> Endpoint {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let port = listener.local_addr().expect("local_addr").port();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&connections);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let index = counter.fetch_add(1, Ordering::Relaxed);
+                    let fail_this = fail_first_connection && index == 0;
+                    let channel = TTcpChannel::with_stream(stream);
+                    let (read_half, write_half) = channel.split().expect("split channel");
+                    let mut i_prot =
+                        TBinaryInputProtocol::new(TFramedReadTransport::new(read_half), true);
+                    let mut o_prot =
+                        TBinaryOutputProtocol::new(TFramedWriteTransport::new(write_half), true);
+                    let processor = IClientRPCServiceSyncProcessor::new(FakeAuthHandler {
+                        fail_open_session: fail_this,
+                    });
+                    // authenticate() = openSession (+ requestStatementId on
+                    // success); closeSession is handled the same way when the
+                    // test closes the session.
+                    if processor.process(&mut i_prot, &mut o_prot).is_err() {
+                        break;
+                    }
+                    if !fail_this && processor.process(&mut i_prot, &mut o_prot).is_err() {
+                        break;
+                    }
+                }
+            });
+            Endpoint::new("127.0.0.1", port)
+        }
+    }
+
     #[test]
     fn default_config() {
         let cfg = SessionConfig::default();
@@ -1030,6 +1296,9 @@ mod tests {
         assert_eq!(cfg.fetch_size, 1024);
         assert_eq!(cfg.query_timeout_ms, 60_000);
         assert_eq!(cfg.connect_timeout, Duration::from_secs(10));
+        assert_eq!(cfg.socket_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(cfg.redirect_cache_ttl, Duration::from_secs(300));
+        assert_eq!(cfg.redirect_cache_max_entries, 1024);
         assert!(cfg.database.is_none());
         assert!(cfg.enable_auto_reconnect);
         assert_eq!(cfg.max_reconnect_attempts, 3);
@@ -1056,6 +1325,7 @@ mod tests {
         let cfg = SessionConfig::default();
         let options = cfg.connection_options();
         assert_eq!(options.connect_timeout, cfg.connect_timeout);
+        assert_eq!(options.socket_timeout, cfg.socket_timeout);
         assert_eq!(options.protocol, RpcProtocol::Binary);
         #[cfg(feature = "tls")]
         assert!(options.tls.is_none());
@@ -1487,6 +1757,30 @@ mod tests {
         let err = session.execute_non_query("SHOW DATABASES").unwrap_err();
         assert!(matches!(err, Error::Thrift(_)), "got {err:?}");
         assert_eq!(accepts.load(Ordering::SeqCst), 1, "no reconnect attempts");
+        // F7: without a reconnect path the desynchronized connection is
+        // marked broken, so is_open() stops lying and pools discard the
+        // session instead of handing it out again.
+        assert!(!session.is_open());
+    }
+
+    /// F4 regression: failover covers the **handshake**, not just the TCP
+    /// connect. One fake server backs both endpoint entries and rejects
+    /// `openSession` on its first connection: whichever entry is tried
+    /// first fails, and the second entry must complete the handshake.
+    #[test]
+    fn open_fails_over_to_next_endpoint_when_authentication_fails() {
+        let endpoint = fake_auth_server::auth_listener(true);
+        let mut session = Session::new(SessionConfig {
+            endpoints: vec![endpoint.clone(), endpoint.clone()],
+            connect_timeout: Duration::from_millis(500),
+            socket_timeout: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        session
+            .open()
+            .expect("the second endpoint entry must take over after the rejected openSession");
+        assert_eq!(session.current_endpoint(), Some(&endpoint));
+        let _ = session.close();
     }
 
     #[test]

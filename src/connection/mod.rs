@@ -26,7 +26,9 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 #[cfg(feature = "tls")]
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use socket2::SockRef;
 
 #[cfg(feature = "tls")]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -97,11 +99,19 @@ pub struct TlsOptions {
     pub client_key_path: Option<std::path::PathBuf>,
 }
 
-/// How to open a [`Connection`]: timeout, wire protocol, optional TLS.
+/// How to open a [`Connection`]: timeouts, wire protocol, optional TLS.
 #[derive(Debug, Clone)]
 pub struct ConnectionOptions {
-    /// TCP connect timeout per endpoint attempt. Default 10 s.
+    /// Total TCP connect timeout per endpoint attempt (shared across every
+    /// resolved address of that endpoint). Default 10 s.
     pub connect_timeout: Duration,
+    /// Client-side bound on each blocking socket read/write (SO_RCVTIMEO /
+    /// SO_SNDTIMEO), applied after the TCP connect and **before** the TLS
+    /// handshake, so it bounds the handshake, every RPC read and the
+    /// best-effort drop-time `closeSession` alike. `None` restores the
+    /// old unbounded blocking behaviour. Default 60 s (matches the default
+    /// server-side `query_timeout_ms`).
+    pub socket_timeout: Option<Duration>,
     /// Wire protocol; must match the server (see [`RpcProtocol`]).
     pub protocol: RpcProtocol,
     /// Wrap the TCP stream in TLS before the Thrift transports.
@@ -113,6 +123,7 @@ impl Default for ConnectionOptions {
     fn default() -> Self {
         Self {
             connect_timeout: Duration::from_secs(10),
+            socket_timeout: Some(Duration::from_secs(60)),
             protocol: RpcProtocol::Binary,
             #[cfg(feature = "tls")]
             tls: None,
@@ -167,6 +178,32 @@ impl Endpoint {
         }
         Ok(Self::new(host, port))
     }
+
+    /// Loose equality for redirect-hint matching: the port must match and
+    /// the host compares case-insensitively after trimming and stripping
+    /// IPv6 brackets; loopback spellings (`localhost`, `127.x.y.z`,
+    /// `::1`) are equivalent to each other. General hostname-vs-IP
+    /// resolution would need DNS and is deliberately not done here.
+    pub fn equivalent(&self, other: &Self) -> bool {
+        self.port == other.port
+            && (normalized_host(&self.host) == normalized_host(&other.host)
+                || (is_loopback_host(&self.host) && is_loopback_host(&other.host)))
+    }
+}
+
+fn normalized_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 impl std::fmt::Display for Endpoint {
@@ -189,15 +226,15 @@ pub struct Connection {
 
 impl Connection {
     /// Establish a TCP connection to `endpoint` (bounded by
-    /// `options.connect_timeout`), optionally wrap it in TLS, and stack
-    /// framed transport + the selected protocol on top.
+    /// `options.connect_timeout`; every subsequent socket read/write is
+    /// bounded by `options.socket_timeout`), optionally wrap it in TLS, and
+    /// stack framed transport + the selected protocol on top.
     pub fn open(endpoint: Endpoint, options: &ConnectionOptions) -> Result<Self> {
-        let stream = connect_stream(&endpoint, options.connect_timeout)?;
-        stream.set_nodelay(true).map_err(thrift::Error::from)?;
+        let stream = connect_stream(&endpoint, options.connect_timeout, options.socket_timeout)?;
 
         #[cfg(feature = "tls")]
         if let Some(tls) = &options.tls {
-            let stream = tls_handshake(&endpoint, stream, tls)?;
+            let stream = tls_handshake(&endpoint, stream, tls, options.socket_timeout)?;
             let shared = SharedTlsStream::new(stream);
             let (input, output) = build_protocols(shared.clone(), shared, options.protocol);
             return Ok(Self {
@@ -257,14 +294,38 @@ where
     }
 }
 
-/// Resolve the endpoint and try each resolved address with the connect timeout.
-fn connect_stream(endpoint: &Endpoint, connect_timeout: Duration) -> Result<TcpStream> {
+/// Resolve the endpoint and try each resolved address, sharing one total
+/// `connect_timeout` budget across all of them (a multi-address hostname
+/// must not multiply the configured bound), then apply `socket_timeout`
+/// and TCP keepalive before handing the stream up.
+fn connect_stream(
+    endpoint: &Endpoint,
+    connect_timeout: Duration,
+    socket_timeout: Option<Duration>,
+) -> Result<TcpStream> {
     let addrs = (endpoint.host.as_str(), endpoint.port)
         .to_socket_addrs()
         .map_err(thrift::Error::from)?;
+    // A single deadline for the whole endpoint attempt. `checked_add`
+    // treats Duration::MAX as "no bound" instead of panicking on overflow.
+    let deadline = Instant::now().checked_add(connect_timeout);
     let mut last_err: Option<std::io::Error> = None;
     for addr in addrs {
-        match TcpStream::connect_timeout(&addr, connect_timeout) {
+        let attempt_timeout = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    last_err = Some(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("connect to {endpoint} timed out"),
+                    ));
+                    break;
+                }
+                remaining
+            }
+            None => connect_timeout,
+        };
+        match connect_one(addr, attempt_timeout, socket_timeout) {
             Ok(stream) => return Ok(stream),
             Err(e) => last_err = Some(e),
         }
@@ -275,12 +336,40 @@ fn connect_stream(endpoint: &Endpoint, connect_timeout: Duration) -> Result<TcpS
     })
 }
 
-/// Run the TLS handshake over an established TCP stream.
+/// Connect one resolved address with the remaining endpoint budget and
+/// configure the socket: TCP_NODELAY, SO_KEEPALIVE, and the optional
+/// SO_RCVTIMEO/SO_SNDTIMEO that bounds every later read/write on this
+/// connection (TLS handshake included).
+fn connect_one(
+    addr: std::net::SocketAddr,
+    connect_timeout: Duration,
+    socket_timeout: Option<Duration>,
+) -> std::io::Result<TcpStream> {
+    // std's connect_timeout keeps the established cross-platform connect
+    // semantics; SockRef then applies the options on the existing socket.
+    let stream = TcpStream::connect_timeout(&addr, connect_timeout)?;
+    let socket = SockRef::from(&stream);
+    socket.set_nodelay(true)?;
+    socket.set_keepalive(true)?;
+    // A zero duration would select non-blocking mode on some platforms;
+    // treat it as "no timeout" instead (None is the documented way).
+    if let Some(timeout) = socket_timeout.filter(|timeout| !timeout.is_zero()) {
+        socket.set_read_timeout(Some(timeout))?;
+        socket.set_write_timeout(Some(timeout))?;
+    }
+    Ok(stream)
+}
+
+/// Run the TLS handshake over an established TCP stream. The stream
+/// already carries the socket-level read/write timeout, so a peer that
+/// accepts and then stalls the handshake fails here instead of blocking
+/// forever.
 #[cfg(feature = "tls")]
 fn tls_handshake(
     endpoint: &Endpoint,
     mut stream: TcpStream,
     tls: &TlsOptions,
+    socket_timeout: Option<Duration>,
 ) -> Result<StreamOwned<ClientConnection, TcpStream>> {
     let config = tls_client_config(tls)?;
     let domain = tls.domain_override.as_deref().unwrap_or(&endpoint.host);
@@ -289,9 +378,19 @@ fn tls_handshake(
     let mut connection =
         ClientConnection::new(config, server_name).map_err(|e| Error::Tls(e.to_string()))?;
 
-    connection
-        .complete_io(&mut stream)
-        .map_err(|e| Error::Tls(e.to_string()))?;
+    connection.complete_io(&mut stream).map_err(|e| {
+        // A blocking socket with SO_RCVTIMEO reports WouldBlock/TimedOut
+        // when the peer stalls the handshake: turn it into an actionable
+        // error instead of leaking the OS error kind.
+        if matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ) {
+            let bound = socket_timeout.map_or("no socket timeout".into(), |t| format!("{t:?}"));
+            return Error::Tls(format!("TLS handshake timed out ({bound})"));
+        }
+        Error::Tls(e.to_string())
+    })?;
     if connection.is_handshaking() {
         return Err(Error::Tls("TLS handshake did not complete".into()));
     }
@@ -547,13 +646,69 @@ mod tests {
         );
     }
 
+    /// F11: redirect-hint matching must tolerate case/bracket/loopback
+    /// spelling differences, but still require the same port.
+    #[test]
+    fn endpoint_equivalent_normalizes_and_matches_loopback() {
+        assert!(Endpoint::new("LOCALHOST", 6667).equivalent(&Endpoint::new("localhost", 6667)));
+        assert!(Endpoint::new("localhost", 6667).equivalent(&Endpoint::new("127.0.0.1", 6667)));
+        assert!(Endpoint::new("127.0.0.1", 6667).equivalent(&Endpoint::new("::1", 6667)));
+        assert!(Endpoint::new("[::1]", 6667).equivalent(&Endpoint::new("::1", 6667)));
+        assert!(!Endpoint::new("localhost", 6667).equivalent(&Endpoint::new("localhost", 6668)));
+        assert!(
+            !Endpoint::new("localhost", 6667).equivalent(&Endpoint::new("iotdb.example.com", 6667))
+        );
+    }
+
     #[test]
     fn default_options_are_binary_no_tls() {
         let options = ConnectionOptions::default();
         assert_eq!(options.connect_timeout, Duration::from_secs(10));
+        assert_eq!(options.socket_timeout, Some(Duration::from_secs(60)));
         assert_eq!(options.protocol, RpcProtocol::Binary);
         #[cfg(feature = "tls")]
         assert!(options.tls.is_none());
+    }
+
+    /// A local listener that accepts connections and then stays silent —
+    /// the equivalent of a peer that finished the TCP handshake and never
+    /// replies (GC pause, dropped firewall state, accepting LB). The accept
+    /// thread parks while holding the stream so it never sends EOF.
+    pub(super) fn silent_listener() -> Endpoint {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+        std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept");
+            std::thread::park();
+        });
+        Endpoint::new("127.0.0.1", port)
+    }
+
+    /// `socket_timeout` must bound reads after the TCP handshake: against
+    /// a peer that accepts and never replies, the RPC returns a Thrift
+    /// error around the configured bound instead of blocking forever.
+    #[test]
+    fn socket_timeout_bounds_reads_after_handshake() {
+        use crate::protocol::client::TIClientRPCServiceSyncClient;
+
+        let endpoint = silent_listener();
+        let options = ConnectionOptions {
+            connect_timeout: Duration::from_millis(500),
+            socket_timeout: Some(Duration::from_millis(300)),
+            ..Default::default()
+        };
+        let mut connection = Connection::open(endpoint, &options).expect("TCP connect succeeds");
+        let started = Instant::now();
+        let err = connection
+            .client_mut()
+            .request_statement_id(1)
+            .expect_err("silent peer must not block forever");
+        assert!(matches!(err, thrift::Error::Transport(_)), "got {err:?}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "read took {elapsed:?}, socket timeout not applied"
+        );
     }
 
     /// A local listener that accepts and immediately drops connections, so
@@ -744,6 +899,7 @@ mod tls_tests {
                 domain_override: Some("localhost".into()),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let mut connection = Connection::open(endpoint, &options).expect("TLS handshake");
         assert_eq!(connection.protocol(), RpcProtocol::Binary);
@@ -771,6 +927,7 @@ mod tls_tests {
                 domain_override: Some("localhost".into()),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let err = match Connection::open(endpoint, &options) {
             Ok(_) => panic!("untrusted self-signed cert must fail the handshake"),
@@ -791,6 +948,7 @@ mod tls_tests {
                 accept_invalid_certs: true,
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let connection = Connection::open(endpoint, &options).expect("TLS handshake");
         assert_eq!(connection.protocol(), RpcProtocol::Compact);
@@ -810,6 +968,7 @@ mod tls_tests {
                 accept_invalid_certs: true,
                 ..Default::default()
             }),
+            ..Default::default()
         };
         assert!(
             Connection::open(endpoint, &options).is_err(),
@@ -821,6 +980,34 @@ mod tls_tests {
         assert_eq!(
             byte, 0x16,
             "expected TLS handshake record type, got 0x{byte:02x}"
+        );
+    }
+
+    /// A socket timeout bounds the TLS handshake itself: against a peer
+    /// that accepts and then stays silent, `Connection::open` fails with a
+    /// TLS timeout error around the configured bound instead of blocking
+    /// forever.
+    #[test]
+    fn tls_handshake_times_out_against_silent_peer() {
+        let endpoint = super::tests::silent_listener();
+        let options = ConnectionOptions {
+            connect_timeout: Duration::from_millis(500),
+            socket_timeout: Some(Duration::from_millis(300)),
+            protocol: RpcProtocol::Binary,
+            tls: Some(TlsOptions {
+                accept_invalid_certs: true,
+                ..Default::default()
+            }),
+        };
+        let started = Instant::now();
+        let err = match Connection::open(endpoint, &options) {
+            Ok(_) => panic!("silent peer must not complete a TLS handshake"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::Tls(_)), "got {err:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "TLS handshake was not bounded by socket_timeout"
         );
     }
 
@@ -838,6 +1025,7 @@ mod tls_tests {
             connect_timeout: Duration::from_millis(500),
             protocol: RpcProtocol::Binary,
             tls: None,
+            ..Default::default()
         };
         Connection::open(endpoint.clone(), &plain).expect("plain open against plain listener");
 
@@ -848,6 +1036,7 @@ mod tls_tests {
                 accept_invalid_certs: true,
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let err = match Connection::open(endpoint, &tls) {
             Ok(_) => panic!("TLS handshake against a plain endpoint must fail"),
@@ -872,6 +1061,7 @@ mod tls_tests {
                 client_key_path: Some(fixture("client-key.pem")),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let connection = Connection::open(endpoint, &options).expect("TLS handshake with identity");
         assert_eq!(connection.protocol(), RpcProtocol::Binary);
@@ -899,6 +1089,7 @@ mod tls_tests {
                     client_key_path: key.clone(),
                     ..Default::default()
                 }),
+                ..Default::default()
             };
             let err = match Connection::open(endpoint.clone(), &options) {
                 Ok(_) => panic!("half a client identity must fail"),
@@ -924,6 +1115,7 @@ mod tls_tests {
                 client_key_path: Some(fixture("does-not-exist-key.pem")),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let err = match Connection::open(endpoint, &options) {
             Ok(_) => panic!("missing client key must fail"),
@@ -949,6 +1141,7 @@ mod tls_tests {
                 client_key_path: Some(fixture("client-cert.pem")), // not a key
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let err = match Connection::open(endpoint, &options) {
             Ok(_) => panic!("a certificate is not a private key"),
@@ -968,6 +1161,7 @@ mod tls_tests {
                 ca_cert_path: Some(fixture("does-not-exist.pem")),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let err = match Connection::open(endpoint, &options) {
             Ok(_) => panic!("missing CA file must fail"),
