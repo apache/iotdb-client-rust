@@ -105,6 +105,38 @@ fn main() -> Result<()> {
         }
     } // dataset drop closes the query and releases the session borrow
 
+    // --- OBJECT column demo (needs IoTDB 2.0.8+; skipped on older servers) -
+    // OBJECT writes use Tablet::set_object_value_at with a 9-byte segment
+    // header (isEOF + big-endian offset). SELECT file renders the size
+    // summary; SELECT READ_OBJECT(file) returns the raw BLOB.
+    if let Err(e) = session.execute_non_query(
+        "CREATE TABLE IF NOT EXISTS objects (\
+           region STRING TAG, \
+           file OBJECT FIELD)",
+    ) {
+        eprintln!("skipping OBJECT demo (server does not support OBJECT): {e}");
+    } else {
+        let object_bytes: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        let mut tablet = Tablet::new_table(
+            "objects",
+            vec!["region".into(), "file".into()],
+            vec![TSDataType::String, TSDataType::Object],
+            vec![ColumnCategory::Tag, ColumnCategory::Field],
+        )?;
+        tablet.add_row(base_ts, vec![Some(Value::String("east".into())), None])?;
+        tablet.set_object_value_at(true, 0, &object_bytes, 1, 0)?;
+        session.insert(&tablet)?;
+        println!("inserted an OBJECT row into `objects`");
+
+        {
+            let mut dataset = session.execute_query("SELECT file FROM objects")?;
+            while let Some(row) = dataset.next_row()? {
+                println!("{:?}", row.values); // e.g. [String("(Object) 1.00 KB")]
+            }
+        }
+        session.execute_non_query("DROP TABLE objects")?;
+    }
+
     // --- Cleanup ----------------------------------------------------------
     session.execute_non_query(&format!("DROP DATABASE {DB}"))?;
     println!("database dropped");

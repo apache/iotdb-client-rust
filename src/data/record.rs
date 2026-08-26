@@ -50,7 +50,10 @@ pub fn serialize_record_values(values: &[Value]) -> Vec<u8> {
                     Value::Float(v) => buf.extend_from_slice(&v.to_be_bytes()),
                     Value::Double(v) => buf.extend_from_slice(&v.to_be_bytes()),
                     Value::Text(s) | Value::String(s) => write_binary(&mut buf, s.as_bytes()),
-                    Value::Blob(b) => write_binary(&mut buf, b),
+                    // OBJECT uses the same length-prefixed binary layout;
+                    // the server rejects tree-model OBJECTs, but the SDK does
+                    // not add an extra client-side restriction (plan §1).
+                    Value::Blob(b) | Value::Object(b) => write_binary(&mut buf, b),
                     Value::Null => unreachable!("handled above"),
                 }
             }
@@ -76,6 +79,7 @@ mod tests {
             Value::Date(20260713),
             Value::Blob(vec![0xDE, 0xAD]),
             Value::String("é".into()),
+            Value::Object(vec![1, 0, 0, 0, 0, 0, 0, 0, 0, 0xDE, 0xAD]),
         ];
 
         let mut expected: Vec<u8> = Vec::new();
@@ -95,6 +99,8 @@ mod tests {
         expected.extend_from_slice(&20260713i32.to_be_bytes()); // yyyyMMdd
         expected.extend_from_slice(&[0x0A, 0, 0, 0, 2, 0xDE, 0xAD]);
         expected.extend_from_slice(&[0x0B, 0, 0, 0, 2, 0xC3, 0xA9]); // "é" UTF-8
+                                                                     // OBJECT: type marker 12 + length-prefixed framed segment.
+        expected.extend_from_slice(&[0x0C, 0, 0, 0, 11, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0xDE, 0xAD]);
         assert_eq!(serialize_record_values(&values), expected);
     }
 

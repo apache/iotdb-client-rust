@@ -296,6 +296,123 @@ mod tests {
         }
     }
 
+    /// Live-server OBJECT write/read round-trip (Go PR 175's
+    /// `Test_InsertObjectTablet` analogue). Skipped when no server is
+    /// reachable, and when the server predates OBJECT support — the probe
+    /// CREATE TABLE fails there and the test skips exactly like the Go e2e.
+    #[test]
+    fn live_object_write_roundtrip() {
+        use crate::data::{ColumnCategory, Value};
+        use std::net::TcpStream;
+        if TcpStream::connect_timeout(
+            &"127.0.0.1:6667".parse().unwrap(),
+            Duration::from_millis(300),
+        )
+        .is_err()
+        {
+            eprintln!("skipping live_object_write_roundtrip: no IoTDB server on 127.0.0.1:6667");
+            return;
+        }
+
+        const DB: &str = "rust_client_object_test";
+        let mut session = TableSession::builder().build().expect("open");
+        let _ = session.execute_non_query(&format!("DROP DATABASE IF EXISTS {DB}"));
+        session
+            .execute_non_query(&format!("CREATE DATABASE {DB}"))
+            .expect("create object test db");
+        session
+            .execute_non_query(&format!("USE {DB}"))
+            .expect("use object test db");
+
+        if let Err(e) = session.execute_non_query(
+            "CREATE TABLE object_table (region_id STRING TAG, file OBJECT FIELD)",
+        ) {
+            eprintln!("skipping live_object_write_roundtrip: server does not support OBJECT ({e})");
+            let _ = session.execute_non_query(&format!("DROP DATABASE IF EXISTS {DB}"));
+            return;
+        }
+
+        let object_bytes: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+        let new_tablet = |region: &str| {
+            let mut tablet = Tablet::new_table(
+                "object_table",
+                vec!["region_id".into(), "file".into()],
+                vec![TSDataType::String, TSDataType::Object],
+                vec![ColumnCategory::Tag, ColumnCategory::Field],
+            )
+            .unwrap();
+            tablet
+                .add_row(0, vec![Some(Value::String(region.into())), None])
+                .unwrap();
+            tablet
+        };
+
+        // Whole object at time 1.
+        let mut tablet = new_tablet("1");
+        tablet.timestamps_mut()[0] = 1;
+        tablet
+            .set_object_value_at(true, 0, &object_bytes, 1, 0)
+            .unwrap();
+        session.insert(&tablet).expect("insert whole object");
+
+        // Segmented object at time 2 (512 + 512): one segment per insert,
+        // the server assembles them into one cell (Go PR 175 does the same).
+        for (offset, is_eof) in [(0, false), (512, true)] {
+            let mut tablet = new_tablet("2");
+            tablet.timestamps_mut()[0] = 2;
+            let start = offset as usize;
+            tablet
+                .set_object_value_at(is_eof, offset, &object_bytes[start..start + 512], 1, 0)
+                .unwrap();
+            session.insert(&tablet).expect("insert object segment");
+        }
+
+        // Null object at time 3.
+        let mut tablet = new_tablet("3");
+        tablet.timestamps_mut()[0] = 3;
+        session.insert(&tablet).expect("insert null object row");
+
+        // count(*)
+        {
+            let mut dataset = session
+                .execute_query("select count(*) from object_table")
+                .unwrap();
+            let row = dataset.next_row().unwrap().unwrap();
+            assert_eq!(row.values[0], Value::Int64(3));
+        }
+
+        // READ_OBJECT(file) stays a raw BLOB, whole and segmented.
+        for time in [1, 2] {
+            let mut dataset = session
+                .execute_query(&format!(
+                    "select READ_OBJECT(file) from object_table where time = {time}"
+                ))
+                .unwrap();
+            let row = dataset.next_row().unwrap().unwrap();
+            match &row.values[0] {
+                Value::Blob(bytes) => assert_eq!(bytes, &object_bytes),
+                other => panic!("expected BLOB for READ_OBJECT, got {other:?}"),
+            }
+        }
+
+        // select file renders the size summary; the null row stays null.
+        for (time, expected) in [(1, Some("(Object) 1.00 KB")), (3, None)] {
+            let mut dataset = session
+                .execute_query(&format!(
+                    "select file from object_table where time = {time}"
+                ))
+                .unwrap();
+            let row = dataset.next_row().unwrap().unwrap();
+            match expected {
+                Some(summary) => assert_eq!(row.values[0], Value::String(summary.into())),
+                None => assert_eq!(row.values[0], Value::Null),
+            }
+        }
+
+        let _ = session.execute_non_query(&format!("DROP DATABASE IF EXISTS {DB}"));
+        session.close().expect("close");
+    }
+
     /// Live-server test; skipped when no IoTDB instance is reachable.
     #[test]
     fn live_table_session_roundtrip() {

@@ -38,5 +38,5 @@ pub use client::table_session::{TableSession, TableSessionBuilder};
 #[cfg(feature = "tls")]
 pub use connection::TlsOptions;
 pub use connection::{ConnectionOptions, Endpoint, RpcProtocol};
-pub use data::{ColumnCategory, TSDataType, Tablet, TsBlock, Value};
+pub use data::{object_bytes_to_string, ColumnCategory, TSDataType, Tablet, TsBlock, Value};
 pub use error::{Error, Result};
