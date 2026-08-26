@@ -1325,6 +1325,68 @@ mod tests {
         assert_eq!(req.is_aligned, Some(true));
     }
 
+    /// insertTablet request assembly for OBJECT columns: the types list
+    /// carries code 12, the values buffer uses the length-prefixed framed
+    /// segment, and the table-model fields (writeToTable + column
+    /// categories) are set exactly as `Session::insert_tablet` sends them.
+    #[test]
+    fn insert_tablet_request_carries_object_type_12() {
+        use crate::data::{ColumnCategory, TSDataType, Tablet, Value};
+
+        let mut tablet = Tablet::new_table(
+            "object_table",
+            vec!["region_id".into(), "file".into()],
+            vec![TSDataType::String, TSDataType::Object],
+            vec![ColumnCategory::Tag, ColumnCategory::Field],
+        )
+        .unwrap();
+        tablet
+            .add_row(
+                1_608_268_702_780,
+                vec![Some(Value::String("r1".into())), None],
+            )
+            .unwrap();
+        tablet
+            .set_object_value_at(true, 0, &[0x01, 0x02, 0x03], 1, 0)
+            .unwrap();
+
+        let req = TSInsertTabletReq::new(
+            1,
+            tablet.table_name().to_string(),
+            tablet.measurements().to_vec(),
+            tablet.serialize_values(),
+            tablet.serialize_timestamps(),
+            tablet.types().iter().map(|t| t.code()).collect(),
+            tablet.row_count() as i32,
+            tablet.is_aligned(),
+            Some(true),
+            Some(
+                tablet
+                    .column_categories()
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.code())
+                    .collect(),
+            ),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(req.prefix_path, "object_table");
+        assert_eq!(req.types, vec![11, 12]);
+        assert_eq!(req.write_to_table, Some(true));
+        assert_eq!(req.column_categories, Some(vec![0, 1]));
+        assert_eq!(req.size, 1);
+        assert_eq!(req.timestamps, 1_608_268_702_780i64.to_be_bytes());
+        // STRING 'r1': i32 len 2 + 'r1'; OBJECT segment: i32 len 12 + framed
+        // payload; two no-null bitmap flags.
+        let mut expected: Vec<u8> = vec![0, 0, 0, 2, b'r', b'1', 0, 0, 0, 12];
+        expected.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02, 0x03]);
+        expected.extend_from_slice(&[0, 0]);
+        assert_eq!(req.values, expected);
+    }
+
     #[test]
     fn insert_tablets_rejects_empty_and_table_model() {
         use crate::data::{tablet::Tablet, ColumnCategory, TSDataType};

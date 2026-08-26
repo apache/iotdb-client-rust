@@ -222,6 +222,10 @@ fn decode_column(
                         Err(e) => Value::Blob(e.into_bytes()),
                     },
                     TSDataType::String => Value::String(decode_utf8(bytes)?),
+                    // OBJECT metadata (8-byte BE size + internal path) stays
+                    // raw here; row assembly formats it via
+                    // `object_bytes_to_string` when the logical type is OBJECT.
+                    TSDataType::Object => Value::Object(bytes),
                     _ => {
                         return Err(Error::Decode(format!(
                             "BinaryArray encoding with incompatible type {ty:?}"
@@ -463,6 +467,34 @@ mod tests {
             block.columns[1],
             vec![Value::Blob(vec![0xCA, 0xFE]), Value::Blob(vec![])]
         );
+    }
+
+    #[test]
+    fn binary_array_object_metadata_and_nulls() {
+        // Server OBJECT cell: 8-byte BE file size + internal path.
+        let mut payload = 1024u64.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"internal/path/1.bin");
+
+        let mut b = header(&[TSDataType::Object], 2, &[ENCODING_BINARY_ARRAY]);
+        b.extend_from_slice(&time_column(&[1, 2]));
+        b.push(1); // mayHaveNull
+        b.push(0b0100_0000); // MSB-first: row 1 null, consumes no payload bytes
+        b.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        b.extend_from_slice(&payload);
+
+        let block = TsBlock::decode(&b).unwrap();
+        assert_eq!(block.column_types, vec![TSDataType::Object]);
+        assert_eq!(block.columns[0], vec![Value::Object(payload), Value::Null]);
+    }
+
+    #[test]
+    fn object_binary_array_truncated_payload_errors() {
+        let mut b = header(&[TSDataType::Object], 1, &[ENCODING_BINARY_ARRAY]);
+        b.extend_from_slice(&time_column(&[1]));
+        b.push(0); // mayHaveNull
+        b.extend_from_slice(&16i32.to_be_bytes()); // claims 16 payload bytes
+        b.extend_from_slice(&[0, 0, 0]); // delivers 3
+        assert!(matches!(TsBlock::decode(&b), Err(Error::Decode(_))));
     }
 
     #[test]

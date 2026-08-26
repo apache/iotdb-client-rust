@@ -172,6 +172,30 @@ cargo run --example table_session
 cargo run --example session_pool
 ```
 
+## OBJECT columns (table model)
+
+Table-model OBJECT columns (IoTDB 2.0.8+) are written with
+`Tablet::set_object_value_at`. Every call wraps one segment in a 9-byte header —
+`[1 byte isEOF][8 byte big-endian offset]` — followed by the segment content, so a
+large object can be streamed without holding it in memory (ascending offsets,
+`is_eof = true` on the last segment; a whole object is one segment at offset 0).
+
+```rust
+let mut tablet = Tablet::new_table(
+    "objects",
+    vec!["region".into(), "file".into()],
+    vec![TSDataType::String, TSDataType::Object],
+    vec![ColumnCategory::Tag, ColumnCategory::Field],
+)?;
+tablet.add_row(1_720_000_000_000, vec![Some(Value::String("east".into())), None])?;
+tablet.set_object_value_at(true, 0, &object_bytes, 1, 0)?;
+session.insert(&tablet)?;
+```
+
+On the read side `SELECT file` returns the server's OBJECT metadata rendered as
+`Value::String("(Object) 1.00 KB")` (see `object_bytes_to_string`), while
+`SELECT READ_OBJECT(file)` keeps returning the raw bytes as `Value::Blob`.
+
 ## TLS & RPC compression
 
 **RPC compression** (IoTDB's term for the Thrift *compact protocol*) is a plain config flag:
@@ -294,7 +318,7 @@ Throughput scales with points per RPC: wider tablets (100 sensors = 100k points 
 | --- | --- |
 | `src/client/` | `Session`, `TableSession`, `SessionPool`, `TableSessionPool`, `SessionDataSet` |
 | `src/connection/` | Low-level Thrift transport (framed transport + binary protocol) |
-| `src/data/` | `Tablet`, `Value`, `TSDataType` (official TSFile codes 0–11), TsBlock decoding, bitmaps |
+| `src/data/` | `Tablet`, `Value`, `TSDataType` (official TSFile codes 0–12), TsBlock decoding, bitmaps |
 | `src/protocol/` | Generated Thrift stubs (do not edit) |
 | `thrift/` | Thrift IDL sources, synced from the IoTDB repo |
 | `examples/` | Runnable examples for both models and the pools |

@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 
 use crate::client::session::{QueryHandle, Session};
 use crate::data::tsblock::TsBlock;
-use crate::data::value::Value;
+use crate::data::value::{object_bytes_to_string, Value};
 use crate::error::{Error, Result};
 
 /// One result row: the timestamp (`None` when the server set
@@ -176,7 +176,7 @@ impl<'a> SessionDataSet<'a> {
             values.push(Self::apply_logical_type(
                 column[i].clone(),
                 self.data_type_list.get(ordinal).map(String::as_str),
-            ));
+            )?);
         }
         let timestamp = (!self.ignore_time_stamp).then(|| block.timestamps[i]);
         Ok(Row { timestamp, values })
@@ -185,14 +185,20 @@ impl<'a> SessionDataSet<'a> {
     /// Re-tag a decoded value with the column's logical type from the
     /// response's `dataTypeList`. TsBlock headers carry the *physical* type
     /// (DATE arrives as INT32, TIMESTAMP as INT64, STRING as TEXT), so the
-    /// block decoder alone cannot distinguish them.
-    fn apply_logical_type(value: Value, logical: Option<&str>) -> Value {
+    /// block decoder alone cannot distinguish them. OBJECT metadata (8-byte
+    /// BE size + internal path) is formatted here into the
+    /// `(Object) 1.00 KB` display string; `READ_OBJECT(file)` results
+    /// keep logical type BLOB and stay raw `Value::Blob`.
+    fn apply_logical_type(value: Value, logical: Option<&str>) -> Result<Value> {
         match (logical, value) {
-            (Some("DATE"), Value::Int32(v)) => Value::Date(v),
-            (Some("TIMESTAMP"), Value::Int64(v)) => Value::Timestamp(v),
-            (Some("STRING"), Value::Text(s)) => Value::String(s),
-            (Some("BLOB"), Value::Text(s)) => Value::Blob(s.into_bytes()),
-            (_, v) => v,
+            (Some("DATE"), Value::Int32(v)) => Ok(Value::Date(v)),
+            (Some("TIMESTAMP"), Value::Int64(v)) => Ok(Value::Timestamp(v)),
+            (Some("STRING"), Value::Text(s)) => Ok(Value::String(s)),
+            (Some("BLOB"), Value::Text(s)) => Ok(Value::Blob(s.into_bytes())),
+            (Some("OBJECT"), Value::Object(bytes)) => {
+                Ok(Value::String(object_bytes_to_string(&bytes)?))
+            }
+            (_, v) => Ok(v),
         }
     }
 
@@ -260,28 +266,68 @@ mod tests {
         use Value::*;
         // Physical → logical re-tags.
         assert_eq!(
-            SessionDataSet::apply_logical_type(Int32(20260713), Some("DATE")),
+            SessionDataSet::apply_logical_type(Int32(20260713), Some("DATE")).unwrap(),
             Date(20260713)
         );
         assert_eq!(
-            SessionDataSet::apply_logical_type(Int64(99), Some("TIMESTAMP")),
+            SessionDataSet::apply_logical_type(Int64(99), Some("TIMESTAMP")).unwrap(),
             Timestamp(99)
         );
         assert_eq!(
-            SessionDataSet::apply_logical_type(Text("s".into()), Some("STRING")),
+            SessionDataSet::apply_logical_type(Text("s".into()), Some("STRING")).unwrap(),
             String("s".into())
         );
         assert_eq!(
-            SessionDataSet::apply_logical_type(Text("b".into()), Some("BLOB")),
+            SessionDataSet::apply_logical_type(Text("b".into()), Some("BLOB")).unwrap(),
             Blob(b"b".to_vec())
         );
         // Pass-throughs: matching physical types and nulls stay untouched.
         assert_eq!(
-            SessionDataSet::apply_logical_type(Int32(5), Some("INT32")),
+            SessionDataSet::apply_logical_type(Int32(5), Some("INT32")).unwrap(),
             Int32(5)
         );
-        assert_eq!(SessionDataSet::apply_logical_type(Null, Some("DATE")), Null);
-        assert_eq!(SessionDataSet::apply_logical_type(Int32(5), None), Int32(5));
+        assert_eq!(
+            SessionDataSet::apply_logical_type(Null, Some("DATE")).unwrap(),
+            Null
+        );
+        assert_eq!(
+            SessionDataSet::apply_logical_type(Int32(5), None).unwrap(),
+            Int32(5)
+        );
+    }
+
+    /// One-object-column TsBlock with the server's 8-byte BE size + path
+    /// payload for the `select file` shape.
+    fn object_block(ts: i64, payload: &[u8]) -> Vec<u8> {
+        let mut b = header(&[TSDataType::Object], 1, &[ENCODING_BINARY_ARRAY]);
+        b.extend_from_slice(&time_column(&[ts]));
+        b.push(0); // mayHaveNull
+        b.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+        b.extend_from_slice(payload);
+        b
+    }
+
+    #[test]
+    fn object_column_renders_size_summary() {
+        let mut payload = 1024u64.to_be_bytes().to_vec();
+        payload.extend_from_slice(b"internal/path/1.bin");
+
+        let mut session = offline_session();
+        let mut h = handle(vec![object_block(1, &payload)], false);
+        h.columns = vec!["file".into()];
+        h.data_type_list = vec!["OBJECT".into()];
+        let mut ds = SessionDataSet::new(&mut session, h);
+        let row = ds.next_row().unwrap().unwrap();
+        assert_eq!(row.values, vec![Value::String("(Object) 1.00 KB".into())]);
+        assert!(ds.next_row().unwrap().is_none());
+    }
+
+    #[test]
+    fn short_object_metadata_is_decode_error() {
+        assert!(matches!(
+            SessionDataSet::apply_logical_type(Value::Object(vec![0; 7]), Some("OBJECT")),
+            Err(Error::Decode(_))
+        ));
     }
 
     #[test]

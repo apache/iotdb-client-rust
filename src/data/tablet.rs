@@ -185,6 +185,65 @@ impl Tablet {
         Ok(())
     }
 
+    /// Builds the wire representation of one OBJECT segment: a 1-byte isEOF
+    /// flag, an 8-byte big-endian offset, then the raw segment content.
+    /// This matches Java's
+    /// `Tablet.addValue(rowIndex, columnIndex, isEOF, offset, content)`.
+    ///
+    /// Whole objects are written as a single segment with
+    /// `is_eof = true` and `offset = 0`.
+    pub fn build_object_value(is_eof: bool, offset: i64, content: &[u8]) -> Result<Vec<u8>> {
+        if offset < 0 {
+            return Err(Error::Client(format!(
+                "OBJECT segment offset must be non-negative, got {offset}"
+            )));
+        }
+        let mut value = Vec::with_capacity(9 + content.len());
+        value.push(u8::from(is_eof));
+        value.extend_from_slice(&offset.to_be_bytes());
+        value.extend_from_slice(content);
+        Ok(value)
+    }
+
+    /// Writes one segment of an OBJECT column value at an existing row —
+    /// the Rust counterpart of Go `Tablet.SetObjectValueAt`.
+    ///
+    /// An OBJECT value can be written in multiple segments so a large
+    /// object does not need to be fully loaded into memory. Segments must
+    /// be written with ascending offsets and the last segment must set
+    /// `is_eof` to `true`. Overwriting a cell sets it back to
+    /// `Some(..)`, which clears the null bit Rust derives from
+    /// `Option` at serialization time (the Go PR's `unmarkNullValueAt`).
+    pub fn set_object_value_at(
+        &mut self,
+        is_eof: bool,
+        offset: i64,
+        content: &[u8],
+        column_index: usize,
+        row_index: usize,
+    ) -> Result<()> {
+        let column_type = self.types.get(column_index).ok_or_else(|| {
+            Error::Client(format!(
+                "column index {column_index} out of range ({} columns)",
+                self.types.len()
+            ))
+        })?;
+        if *column_type != TSDataType::Object {
+            return Err(Error::Client(format!(
+                "column {column_index} must be of type OBJECT, got {column_type:?}"
+            )));
+        }
+        if row_index >= self.row_count() {
+            return Err(Error::Client(format!(
+                "row index {row_index} out of range ({} rows)",
+                self.row_count()
+            )));
+        }
+        let framed = Self::build_object_value(is_eof, offset, content)?;
+        self.values[column_index][row_index] = Some(Value::Object(framed));
+        Ok(())
+    }
+
     /// Stably sorts rows by timestamp, reordering all value columns in step.
     pub fn sort_by_timestamp(&mut self) {
         let n = self.timestamps.len();
@@ -271,7 +330,12 @@ fn write_cell(buf: &mut Vec<u8>, ty: TSDataType, cell: Option<&Value>) {
             write_binary(buf, s.as_bytes());
         }
         (TSDataType::Blob, Some(Value::Blob(b))) => write_binary(buf, b),
-        (TSDataType::Text | TSDataType::String | TSDataType::Blob, None) => write_binary(buf, &[]),
+        // OBJECT cells carry the framed segment (isEOF + offset + content);
+        // the wire encoding is the same length-prefixed binary layout as BLOB.
+        (TSDataType::Object, Some(Value::Object(b))) => write_binary(buf, b),
+        (TSDataType::Text | TSDataType::String | TSDataType::Blob | TSDataType::Object, None) => {
+            write_binary(buf, &[])
+        }
         // Null sentinel 10000101 = 1000-01-01 (yyyyMMdd), per C#/Java.
         (TSDataType::Date, Some(Value::Date(v))) => buf.extend_from_slice(&v.to_be_bytes()),
         (TSDataType::Date, None) => buf.extend_from_slice(&10000101i32.to_be_bytes()),
@@ -336,6 +400,7 @@ mod tests {
             TSDataType::Date,
             TSDataType::Blob,
             TSDataType::String,
+            TSDataType::Object,
         ];
         let mut t = tree_tablet(types);
         t.add_row(
@@ -351,6 +416,9 @@ mod tests {
                 Some(Value::Date(20260710)),
                 Some(Value::Blob(vec![0xDE, 0xAD])),
                 Some(Value::String("é".into())),
+                Some(Value::Object(
+                    Tablet::build_object_value(true, 0, &[0xDE, 0xAD]).unwrap(),
+                )),
             ],
         )
         .unwrap();
@@ -366,7 +434,9 @@ mod tests {
         expected.extend_from_slice(&20260710i32.to_be_bytes());
         expected.extend_from_slice(&[0, 0, 0, 2, 0xDE, 0xAD]);
         expected.extend_from_slice(&[0, 0, 0, 2, 0xC3, 0xA9]); // "é" UTF-8
-        expected.extend_from_slice(&[0; 10]); // 10 columns, no nulls
+                                                               // OBJECT: length-prefixed framed segment (isEOF=1, offset=0, content).
+        expected.extend_from_slice(&[0, 0, 0, 11, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0xDE, 0xAD]);
+        expected.extend_from_slice(&[0; 11]); // 11 columns, no nulls
         assert_eq!(t.serialize_values(), expected);
     }
 
@@ -383,6 +453,7 @@ mod tests {
             TSDataType::Date,
             TSDataType::Blob,
             TSDataType::String,
+            TSDataType::Object,
         ];
         let n = types.len();
         let mut t = tree_tablet(types);
@@ -399,6 +470,7 @@ mod tests {
         expected.extend_from_slice(&10000101i32.to_be_bytes()); // 1000-01-01
         expected.extend_from_slice(&[0, 0, 0, 0]); // empty blob
         expected.extend_from_slice(&[0, 0, 0, 0]); // empty string
+        expected.extend_from_slice(&[0, 0, 0, 0]); // empty object
         for _ in 0..n {
             expected.extend_from_slice(&[0x01, 0x01]); // flag + bitmap (row 0 null)
         }
@@ -517,6 +589,104 @@ mod tests {
                 ColumnCategory::Attribute
             ]
         );
+    }
+
+    fn object_tablet() -> Tablet {
+        Tablet::new_table(
+            "object_table",
+            vec!["region_id".into(), "file".into()],
+            vec![TSDataType::String, TSDataType::Object],
+            vec![ColumnCategory::Tag, ColumnCategory::Field],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn new_table_accepts_object_column() {
+        let t = object_tablet();
+        assert!(t.is_table_model());
+        assert_eq!(t.types(), [TSDataType::String, TSDataType::Object]);
+    }
+
+    #[test]
+    fn build_object_value_frames_segments() {
+        assert_eq!(
+            Tablet::build_object_value(true, 0, &[0x11, 0x22]).unwrap(),
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x22]
+        );
+        assert_eq!(
+            Tablet::build_object_value(false, 512, &[0x33]).unwrap(),
+            [0, 0, 0, 0, 0, 0, 0, 2, 0, 0x33]
+        );
+        assert!(matches!(
+            Tablet::build_object_value(true, -1, &[]),
+            Err(Error::Client(m)) if m.contains("non-negative")
+        ));
+    }
+
+    #[test]
+    fn set_object_value_at_writes_whole_and_segmented_rows() {
+        let mut t = object_tablet();
+        t.add_row(1, vec![Some(Value::String("r1".into())), None])
+            .unwrap();
+        t.add_row(2, vec![Some(Value::String("r2".into())), None])
+            .unwrap();
+        t.set_object_value_at(true, 0, &[0x11, 0x22], 1, 0).unwrap();
+        t.set_object_value_at(false, 512, &[0x33], 1, 1).unwrap();
+
+        let expected: Vec<u8> = vec![
+            0, 0, 0, 2, b'r', b'1', // tag col row 0: "r1"
+            0, 0, 0, 2, b'r', b'2', // tag col row 1: "r2"
+            0, 0, 0, 11, // object row 0: framed segment length 11
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x22, // isEOF=1, offset=0
+            0, 0, 0, 10, // object row 1: framed segment length 10
+            0, 0, 0, 0, 0, 0, 0, 2, 0, 0x33, // isEOF=0, offset=512
+            0, 0, // trailing bitmap flags: no nulls
+        ];
+        assert_eq!(t.serialize_values(), expected);
+    }
+
+    #[test]
+    fn set_object_value_at_clears_previously_null_cell() {
+        let mut t = object_tablet();
+        t.add_row(1, vec![Some(Value::String("r1".into())), None])
+            .unwrap();
+        // Null OBJECT cell: empty placeholder + [tag flag 0][object flag 1][bitmap 0x01].
+        let with_null = t.serialize_values();
+        assert_eq!(&with_null[6..], [0, 0, 0, 0, 0, 1, 1]);
+
+        t.set_object_value_at(true, 0, &[0x44], 1, 0).unwrap();
+        let without_null = t.serialize_values();
+        assert_eq!(without_null.len(), 6 + 4 + 10 + 2);
+        // Both columns now report "no nulls".
+        assert_eq!(&without_null[without_null.len() - 2..], [0, 0]);
+    }
+
+    #[test]
+    fn set_object_value_at_rejects_invalid_inputs() {
+        let mut t = object_tablet();
+        t.add_row(1, vec![Some(Value::String("r1".into())), None])
+            .unwrap();
+        // Non-OBJECT column.
+        assert!(matches!(
+            t.set_object_value_at(true, 0, &[0x01], 0, 0),
+            Err(Error::Client(m)) if m.contains("must be of type OBJECT")
+        ));
+        // Row out of range.
+        assert!(matches!(
+            t.set_object_value_at(true, 0, &[0x01], 1, 1),
+            Err(Error::Client(m)) if m.contains("row index")
+        ));
+        // Column out of range.
+        assert!(matches!(
+            t.set_object_value_at(true, 0, &[0x01], 2, 0),
+            Err(Error::Client(m)) if m.contains("column index")
+        ));
+        // Negative offset.
+        assert!(matches!(
+            t.set_object_value_at(true, -1, &[0x01], 1, 0),
+            Err(Error::Client(m)) if m.contains("non-negative")
+        ));
     }
 
     #[test]

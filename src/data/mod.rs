@@ -16,7 +16,7 @@
 // under the License.
 
 //! Data structures: TSDataType codes, Value, Tablet, TsBlock, bitmap helpers.
-//! Data-type codes must match the official TSFile spec (0–11), identical
+//! Data-type codes must match the official TSFile spec (0–12), identical
 //! across all IoTDB client SDKs.
 
 pub mod bitmap;
@@ -27,7 +27,7 @@ pub mod value;
 
 pub use tablet::Tablet;
 pub use tsblock::TsBlock;
-pub use value::Value;
+pub use value::{object_bytes_to_string, Value};
 
 /// Official TSFile data type codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +45,10 @@ pub enum TSDataType {
     Date = 9,
     Blob = 10,
     String = 11,
+    /// Table-model OBJECT (IoTDB 2.0.8+). Cells carry the already-framed
+    /// segment bytes: `[1 byte isEOF][8 byte big-endian offset][content]`
+    /// (see `Tablet::build_object_value` / `Tablet::set_object_value_at`).
+    Object = 12,
 }
 
 impl TSDataType {
@@ -69,6 +73,7 @@ impl TSDataType {
             9 => TSDataType::Date,
             10 => TSDataType::Blob,
             11 => TSDataType::String,
+            12 => TSDataType::Object,
             _ => return None,
         })
     }
@@ -113,15 +118,16 @@ mod tests {
         assert_eq!(TSDataType::Date.code(), 9);
         assert_eq!(TSDataType::Blob.code(), 10);
         assert_eq!(TSDataType::String.code(), 11);
+        assert_eq!(TSDataType::Object.code(), 12);
     }
 
     #[test]
     fn data_type_from_code_round_trips() {
-        for code in 0u8..=11 {
+        for code in 0u8..=12 {
             let ty = TSDataType::from_code(code).expect("valid code");
             assert_eq!(ty.code(), i32::from(code));
         }
-        assert_eq!(TSDataType::from_code(12), None);
+        assert_eq!(TSDataType::from_code(13), None);
         assert_eq!(TSDataType::from_code(255), None);
     }
 

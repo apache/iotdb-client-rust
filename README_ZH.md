@@ -172,6 +172,29 @@ cargo run --example table_session
 cargo run --example session_pool
 ```
 
+## OBJECT 列（表模型）
+
+表模型 OBJECT 列（IoTDB 2.0.8+）通过 `Tablet::set_object_value_at` 写入。每次调用
+将一段内容包上 9 字节头——`[1 字节 isEOF][8 字节大端 offset]`——再接上段内容，因此大对象
+可以分段写入而无需整体驻留内存（offset 递增，最后一段 `is_eof = true`；整对象即 offset 0 的
+单段写入）。
+
+```rust
+let mut tablet = Tablet::new_table(
+    "objects",
+    vec!["region".into(), "file".into()],
+    vec![TSDataType::String, TSDataType::Object],
+    vec![ColumnCategory::Tag, ColumnCategory::Field],
+)?;
+tablet.add_row(1_720_000_000_000, vec![Some(Value::String("east".into())), None])?;
+tablet.set_object_value_at(true, 0, &object_bytes, 1, 0)?;
+session.insert(&tablet)?;
+```
+
+读取侧 `SELECT file` 会把服务端返回的 OBJECT 元数据渲染为
+`Value::String("(Object) 1.00 KB")`（见 `object_bytes_to_string`）；
+`SELECT READ_OBJECT(file)` 仍以 `Value::Blob` 返回原始字节。
+
 ## TLS 与 RPC 压缩
 
 **RPC 压缩**（IoTDB 术语，实为 Thrift *compact 协议*）只是一个配置开关：
@@ -293,7 +316,7 @@ cargo run --release --example benchmark -- --mode table \
 | --- | --- |
 | `src/client/` | `Session`、`TableSession`、`SessionPool`、`TableSessionPool`、`SessionDataSet` |
 | `src/connection/` | 底层 Thrift 传输（帧传输 + 二进制协议） |
-| `src/data/` | `Tablet`、`Value`、`TSDataType`（官方 TSFile 编码 0–11）、TsBlock 解码、位图 |
+| `src/data/` | `Tablet`、`Value`、`TSDataType`（官方 TSFile 编码 0–12）、TsBlock 解码、位图 |
 | `src/protocol/` | 生成的 Thrift 桩代码（勿编辑） |
 | `thrift/` | Thrift IDL 源文件，从 IoTDB 仓库同步 |
 | `examples/` | 两种模型及会话池的可运行示例 |
